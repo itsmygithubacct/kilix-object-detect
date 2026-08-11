@@ -21,6 +21,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #define ERROR_MAX 160
@@ -460,19 +461,42 @@ bool kod_open(kod_detector **out, const kod_options *options)
     return true;
 }
 
-void kod_close(kod_detector *detector)
+/*
+ * Ask, wait, insist.
+ *
+ * A plain kill-and-wait can hang forever: a model mid-inference on a busy
+ * machine does not return to its interpreter to notice a signal.  A
+ * program that cannot be closed is worse than a child that had to be
+ * killed, so the wait is bounded and then it is not a request any more.
+ */
+static void reap(pid_t child)
 {
     int status;
 
+    if (child <= 0) {
+        return;
+    }
+    (void)kill(child, SIGTERM);
+    for (int waited = 0; waited < 2000; waited += 20) {
+        struct timespec pause = {0, 20 * 1000 * 1000};
+
+        if (waitpid(child, &status, WNOHANG) == child) {
+            return;
+        }
+        (void)nanosleep(&pause, NULL);
+    }
+    (void)kill(child, SIGKILL);
+    (void)waitpid(child, &status, 0);
+}
+
+void kod_close(kod_detector *detector)
+{
     if (detector == NULL) {
         return;
     }
     if (detector->to_child >= 0) { (void)close(detector->to_child); }
     if (detector->from_child >= 0) { (void)close(detector->from_child); }
-    if (detector->child > 0) {
-        (void)kill(detector->child, SIGTERM);
-        (void)waitpid(detector->child, &status, 0);
-    }
+    reap(detector->child);
     free(detector->square);
     free(detector);
 }
