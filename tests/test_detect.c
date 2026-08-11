@@ -221,6 +221,7 @@ static bool test_the_threshold_and_the_allowlist(void)
 static bool test_a_dead_detector_is_survivable(void)
 {
     static const char *const MISSING[] = {"kilix-no-such-detector", NULL};
+    static const char *const LOG = "build/test-detect-child.log";
     kod_options options;
     kod_detector *detector = NULL;
     uint8_t *frame = blank();
@@ -232,12 +233,30 @@ static bool test_a_dead_detector_is_survivable(void)
     options.argv = MISSING;
     options.size = SIZE;
     options.timeout_seconds = 2;
-    CHECK(kod_open(&detector, &options));
-    CHECK(!kod_detect(detector, frame, W, H, boxes, KOD_BOX_MAX, &count));
-    CHECK(kod_error(detector) != NULL);
-    /* And it stays refused rather than hanging again on every frame. */
-    CHECK(!kod_detect(detector, frame, W, H, boxes, KOD_BOX_MAX, &count));
-    kod_close(detector);
+    options.log_path = LOG;
+    (void)remove(LOG);
+    /*
+     * Refused at open, not on the first crop.
+     *
+     * This used to succeed and surface as "the detector stopped reading"
+     * later, against an empty log - which on a recorder reads as a model
+     * that crashed rather than one that was never installed.
+     */
+    CHECK(!kod_open(&detector, &options));
+    CHECK(detector == NULL);
+    {
+        FILE *log = fopen(LOG, "r");
+        char line[512] = "";
+        bool said = false;
+
+        CHECK(log != NULL);
+        said = fgets(line, (int)sizeof(line), log) != NULL;
+        (void)fclose(log);
+        CHECK(said);
+        CHECK(strstr(line, "kilix-no-such-detector") != NULL);
+    }
+    (void)boxes;
+    (void)count;
     free(frame);
     return true;
 }
