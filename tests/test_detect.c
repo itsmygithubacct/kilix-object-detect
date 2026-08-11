@@ -271,6 +271,98 @@ static bool test_rejections(void)
     return true;
 }
 
+/*
+ * The whole point of the non-blocking path: offering costs nothing and
+ * the answer arrives later, at the same coordinates the blocking call
+ * would have produced.
+ */
+static bool test_offering_does_not_wait(void)
+{
+    kod_detector *detector = NULL;
+    uint8_t *frame = blank();
+    kod_box async_boxes[KOD_BOX_MAX];
+    kod_box sync_boxes[KOD_BOX_MAX];
+    kod_rect regions[2];
+    size_t async_count = 0u;
+    size_t sync_count = 0u;
+    bool done = false;
+    int spins = 0;
+
+    CHECK(frame != NULL);
+    CHECK(start(&detector, 0.1f));
+    regions[0].x = 0;    regions[0].y = 0;   regions[0].w = 200;
+    regions[0].h = 200;
+    regions[1].x = 400;  regions[1].y = 100; regions[1].w = 160;
+    regions[1].h = 160;
+
+    CHECK(kod_offer(detector, frame, W, H, regions, 2u));
+    CHECK(kod_busy(detector));
+    /* A second offer while one is in flight is refused, and refusing must
+     * not be recorded as a fault. */
+    CHECK(!kod_offer(detector, frame, W, H, regions, 2u));
+    CHECK(kod_error(detector) == NULL);
+
+    while (!done && spins < 100000) {
+        CHECK(kod_take(detector, async_boxes, KOD_BOX_MAX, &async_count,
+                       &done));
+        spins++;
+    }
+    CHECK(done);
+    CHECK(!kod_busy(detector));
+    CHECK(async_count > 0u);
+    /* Taking again with nothing in flight is done, not an error. */
+    done = false;
+    CHECK(kod_take(detector, async_boxes, KOD_BOX_MAX, NULL, &done));
+    CHECK(done);
+
+    /* ...and the same regions through the blocking call agree. */
+    CHECK(kod_offer(detector, frame, W, H, regions, 2u) || true);
+    while (kod_busy(detector)) {
+        CHECK(kod_take(detector, sync_boxes, KOD_BOX_MAX, &sync_count, &done));
+    }
+    CHECK(kod_detect_regions(detector, frame, W, H, regions, 2u, sync_boxes,
+                             KOD_BOX_MAX, &sync_count));
+    CHECK(sync_count == async_count);
+    for (size_t i = 0u; i < sync_count; i++) {
+        CHECK(sync_boxes[i].at.x == async_boxes[i].at.x);
+        CHECK(sync_boxes[i].at.y == async_boxes[i].at.y);
+        CHECK(sync_boxes[i].at.w == async_boxes[i].at.w);
+        CHECK(sync_boxes[i].at.h == async_boxes[i].at.h);
+    }
+    kod_close(detector);
+    free(frame);
+    return true;
+}
+
+/* The frame may go away the moment it has been offered. */
+static bool test_the_frame_may_be_released(void)
+{
+    kod_detector *detector = NULL;
+    uint8_t *frame = blank();
+    kod_box boxes[KOD_BOX_MAX];
+    kod_rect regions[2];
+    size_t count = 0u;
+    bool done = false;
+
+    CHECK(frame != NULL);
+    CHECK(start(&detector, 0.1f));
+    regions[0].x = 0;    regions[0].y = 0;   regions[0].w = 200;
+    regions[0].h = 200;
+    regions[1].x = 400;  regions[1].y = 100; regions[1].w = 160;
+    regions[1].h = 160;
+    CHECK(kod_offer(detector, frame, W, H, regions, 2u));
+    /* Freed while a two-crop batch is in flight: the second crop must
+     * already be the detector's own copy, or this reads freed memory and
+     * the answer changes with whatever lands there. */
+    free(frame);
+    while (!done) {
+        CHECK(kod_take(detector, boxes, KOD_BOX_MAX, &count, &done));
+    }
+    CHECK(count > 0u);
+    kod_close(detector);
+    return true;
+}
+
 int main(void)
 {
     const struct {
@@ -288,7 +380,10 @@ int main(void)
          test_the_threshold_and_the_allowlist},
         {"a dead detector is survivable",
          test_a_dead_detector_is_survivable},
-        {"rejections", test_rejections}
+        {"rejections", test_rejections},
+        {"offering does not wait", test_offering_does_not_wait},
+        {"the frame may be released",
+         test_the_frame_may_be_released}
     };
     size_t passed = 0u;
 
