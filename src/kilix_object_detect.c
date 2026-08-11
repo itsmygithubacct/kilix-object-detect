@@ -791,3 +791,82 @@ bool kod_detect_regions(
     }
     return true;
 }
+
+/* ------------------------------- drawing --------------------------------- */
+
+static void put(uint8_t *bgra, int width, int height, int x, int y,
+                uint32_t colour, float alpha)
+{
+    uint8_t *pixel;
+
+    if (x < 0 || y < 0 || x >= width || y >= height) {
+        return;
+    }
+    pixel = bgra + ((size_t)y * (size_t)width + (size_t)x) * 4u;
+    pixel[0] = (uint8_t)((float)pixel[0] * (1.0f - alpha) +
+                         (float)(colour & 0xFFu) * alpha);
+    pixel[1] = (uint8_t)((float)pixel[1] * (1.0f - alpha) +
+                         (float)((colour >> 8) & 0xFFu) * alpha);
+    pixel[2] = (uint8_t)((float)pixel[2] * (1.0f - alpha) +
+                         (float)((colour >> 16) & 0xFFu) * alpha);
+}
+
+static void outline(uint8_t *bgra, int width, int height, const kod_rect *at,
+                    uint32_t colour, float alpha, int thickness)
+{
+    for (int t = 0; t < thickness; t++) {
+        const int x0 = at->x + t;
+        const int y0 = at->y + t;
+        const int x1 = at->x + at->w - 1 - t;
+        const int y1 = at->y + at->h - 1 - t;
+
+        for (int x = x0; x <= x1; x++) {
+            put(bgra, width, height, x, y0, colour, alpha);
+            put(bgra, width, height, x, y1, colour, alpha);
+        }
+        for (int y = y0; y <= y1; y++) {
+            put(bgra, width, height, x0, y, colour, alpha);
+            put(bgra, width, height, x1, y, colour, alpha);
+        }
+    }
+}
+
+/* Person green, vehicles blue, animals amber: three groups is what the
+ * eye can read at a glance, where sixteen colours is a legend. */
+uint32_t kod_class_colour(int class_id)
+{
+    switch (class_id) {
+    case 0:
+        return 0x60FF80u;
+    case 1: case 2: case 3: case 5: case 7:
+        return 0x60B0FFu;
+    case 14: case 15: case 16: case 17: case 18: case 19: case 21:
+        return 0xFFC040u;
+    default:
+        return 0xFF80C0u;
+    }
+}
+
+void kod_draw_regions(
+    uint8_t *bgra, int width, int height, const kod_rect *regions,
+    size_t count)
+{
+    if (bgra == NULL || regions == NULL) {
+        return;
+    }
+    for (size_t i = 0u; i < count; i++) {
+        outline(bgra, width, height, &regions[i], 0x808080u, 0.35f, 1);
+    }
+}
+
+void kod_draw_boxes(
+    uint8_t *bgra, int width, int height, const kod_box *boxes, size_t count)
+{
+    if (bgra == NULL || boxes == NULL || width <= 0 || height <= 0) {
+        return;
+    }
+    for (size_t i = 0u; i < count; i++) {
+        outline(bgra, width, height, &boxes[i].at,
+                kod_class_colour(boxes[i].class_id), 1.0f, 2);
+    }
+}

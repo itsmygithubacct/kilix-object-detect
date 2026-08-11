@@ -38,16 +38,10 @@ void kod_redact(const char *source, char *out, size_t size);
 uint8_t *kod_grab(const char *source, int *width, int *height,
                   const char **reason);
 
-/* Draw boxes and labels onto a BGRA frame in place. */
-void kod_draw_boxes(
+/* Labels over the boxes.  The outlines themselves are kod_draw_boxes(),
+ * in the library, so every caller draws them identically. */
+void kod_draw_labels(
     uint8_t *bgra, int width, int height, const kod_box *boxes, size_t count);
-
-/* Draw the crops the detector was given, dimmer than the detections: the
- * question "why did it not see that" is usually answered by where the
- * crops were. */
-void kod_draw_regions(
-    uint8_t *bgra, int width, int height, const kod_rect *regions,
-    size_t count);
 
 /* Write a BGRA frame out as a PPM, for looking at without a terminal. */
 bool kod_write_ppm(const char *path, const uint8_t *bgra, int width,
