@@ -361,6 +361,8 @@ static bool argv_from_env(const char *variable, char *storage,
     return true;
 }
 
+static void reap(pid_t child);
+
 bool kod_open(kod_detector **out, const kod_options *options)
 {
     kod_options defaults;
@@ -372,6 +374,7 @@ bool kod_open(kod_detector **out, const kod_options *options)
     kod_detector *detector;
     int to_child[2];
     int from_child[2];
+    int status[2];
     char geometry[32];
 
     if (out == NULL) {
@@ -444,10 +447,22 @@ bool kod_open(kod_detector **out, const kod_options *options)
     }
     (void)snprintf(geometry, sizeof(geometry), "%dx%d", detector->size,
                    detector->size);
+    /* Close-on-exec, so a successful exec closes it and the parent reads
+     * end-of-file.  Anything that arrives instead is the errno that
+     * stopped it. */
+    if (pipe(status) != 0) {
+        (void)close(to_child[0]); (void)close(to_child[1]);
+        (void)close(from_child[0]); (void)close(from_child[1]);
+        free(detector->square);
+        free(detector);
+        return false;
+    }
+    (void)fcntl(status[1], F_SETFD, FD_CLOEXEC);
     detector->child = fork();
     if (detector->child < 0) {
         (void)close(to_child[0]); (void)close(to_child[1]);
         (void)close(from_child[0]); (void)close(from_child[1]);
+        (void)close(status[0]); (void)close(status[1]);
         free(detector->square);
         free(detector);
         return false;
@@ -477,10 +492,45 @@ bool kod_open(kod_detector **out, const kod_options *options)
         child_argv[count++] = geometry;
         child_argv[count] = NULL;
         (void)execvp(child_argv[0], child_argv);
+        /*
+         * Exec failed, and this is the only moment anything knows why.
+         *
+         * The log first, then the signal down the status pipe: kod_open()
+         * returns as soon as it reads that, and a caller looking at the
+         * log would otherwise find it empty.  Losing this is how a
+         * detector nobody installed becomes "the detector stopped
+         * reading" seconds later, against a blank log.
+         */
+        {
+            const int reason = errno;
+
+            (void)dprintf(STDERR_FILENO,
+                          "kilix-object-detect: cannot run %s: %s\n",
+                          child_argv[0], strerror(reason));
+            (void)write(status[1], &reason, sizeof(reason));
+        }
         _exit(127);
     }
     (void)close(to_child[0]);
     (void)close(from_child[1]);
+    (void)close(status[1]);
+    {
+        int reason = 0;
+        const ssize_t got = read(status[0], &reason, sizeof(reason));
+
+        (void)close(status[0]);
+        if (got == (ssize_t)sizeof(reason)) {
+            /* It never started.  Refusing here beats a detector that
+             * looks open and reports a broken pipe on the first crop -
+             * which is indistinguishable from a model that crashed. */
+            (void)close(to_child[1]);
+            (void)close(from_child[0]);
+            reap(detector->child);
+            free(detector->square);
+            free(detector);
+            return false;
+        }
+    }
     detector->to_child = to_child[1];
     detector->from_child = from_child[0];
     (void)signal(SIGPIPE, SIG_IGN);
