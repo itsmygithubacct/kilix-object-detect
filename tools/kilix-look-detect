@@ -1,0 +1,101 @@
+#!/usr/bin/env python3
+"""The object detector, as the subprocess kilix-look talks to.
+
+The contract is 480 bytes: read one BGRA frame from stdin, write
+float32[20][6] to stdout, rows of [class, score, y0, x0, y1, x1] with
+coordinates normalised 0-1, score-ordered.  Both sides are fixed size, so
+the framing is the sizes themselves.
+
+Nothing about this is specific to a model or a machine.  Swapping
+ultralytics for a TensorRT engine, or running this on a GPU box over ssh,
+changes nothing on the other side of the pipe - which is the point of
+making the detector a process rather than a library.
+
+  --geometry WxH   frame size, passed by the caller
+  --model NAME     default yolo26s; yolo26n misses real people in infrared
+  --device DEV     cpu, cuda, ... passed through to the model
+"""
+import argparse
+import os
+import struct
+import sys
+
+ROWS, COLUMNS = 20, 6
+REPLY_BYTES = ROWS * COLUMNS * 4
+
+
+def empty_reply():
+    return struct.pack("<%df" % (ROWS * COLUMNS), *([0.0] * (ROWS * COLUMNS)))
+
+
+def read_exactly(stream, size):
+    chunks = []
+    remaining = size
+    while remaining > 0:
+        chunk = stream.read(remaining)
+        if not chunk:
+            return None
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--geometry", default="640x360")
+    parser.add_argument("--model", default="yolo26s")
+    parser.add_argument("--device", default=None)
+    parser.add_argument("--conf", type=float, default=0.25)
+    options = parser.parse_args()
+
+    width, _, height = options.geometry.partition("x")
+    width, height = int(width), int(height)
+    frame_bytes = width * height * 4
+
+    model = None
+    try:
+        from ultralytics import YOLO
+        model = YOLO(options.model)
+    except Exception as problem:                      # noqa: BLE001
+        # Answering with zeros beats dying: the caller degrades that
+        # camera to motion-only, which is a working recorder, while a
+        # dead pipe would take the recording down with the detection.
+        print(f"kilix-look-detect: {options.model}: {problem}",
+              file=sys.stderr, flush=True)
+
+    stdin = sys.stdin.buffer
+    stdout = sys.stdout.buffer
+    while True:
+        frame = read_exactly(stdin, frame_bytes)
+        if frame is None:
+            return 0
+        rows = [0.0] * (ROWS * COLUMNS)
+        if model is not None:
+            try:
+                import numpy as np
+
+                image = np.frombuffer(frame, dtype=np.uint8)
+                image = image.reshape((height, width, 4))[:, :, :3]
+                # BGRA in, and ultralytics wants BGR, which is what the
+                # first three channels already are.
+                result = model.predict(image, conf=options.conf,
+                                       device=options.device, verbose=False)[0]
+                boxes = result.boxes
+                order = boxes.conf.argsort(descending=True)[:ROWS]
+                for slot, index in enumerate(order):
+                    x0, y0, x1, y1 = boxes.xyxy[index].tolist()
+                    rows[slot * COLUMNS + 0] = float(boxes.cls[index])
+                    rows[slot * COLUMNS + 1] = float(boxes.conf[index])
+                    rows[slot * COLUMNS + 2] = y0 / height
+                    rows[slot * COLUMNS + 3] = x0 / width
+                    rows[slot * COLUMNS + 4] = y1 / height
+                    rows[slot * COLUMNS + 5] = x1 / width
+            except Exception as problem:              # noqa: BLE001
+                print(f"kilix-look-detect: {problem}", file=sys.stderr,
+                      flush=True)
+        stdout.write(struct.pack("<%df" % (ROWS * COLUMNS), *rows))
+        stdout.flush()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
