@@ -29,6 +29,12 @@
 #define KOD_DETECTOR_ENV "KILIX_OBJECT_DETECTOR"
 #define KOD_DETECTOR_NAME "kilix-look-detect"
 
+typedef struct fit {
+    float scale;      /* source pixels per square pixel */
+    int offset_x;     /* where the image starts inside the square */
+    int offset_y;
+} fit;
+
 struct kod_detector {
     pid_t child;
     int to_child;
@@ -42,6 +48,27 @@ struct kod_detector {
     uint8_t *square;      /* size * size * 4, reused every call */
     uint64_t crops;
     char error[ERROR_MAX];
+
+    /*
+     * A batch in flight, for the callers that cannot wait.
+     *
+     * The crops are scaled up front and held here rather than re-derived
+     * when their turn comes: by the time the second reply arrives the
+     * caller has long since released the frame these were cut from, and a
+     * detector that keeps a pointer into a borrowed frame is a detector
+     * that reads a later frame's pixels.
+     */
+    uint8_t *queued[KOD_REGION_MAX];
+    fit placements[KOD_REGION_MAX];
+    kod_rect regions[KOD_REGION_MAX];
+    int frame_width;
+    int frame_height;
+    size_t batch;         /* crops in this batch */
+    size_t sent;          /* ...written to the child */
+    kod_box collected[KOD_BOX_MAX];
+    size_t collected_count;
+    int64_t sent_at_ms;   /* when the outstanding crop went out */
+    bool busy;
 };
 
 static const struct {
@@ -489,6 +516,14 @@ static void reap(pid_t child)
     (void)waitpid(child, &status, 0);
 }
 
+static void free_queued(kod_detector *detector)
+{
+    for (size_t i = 0u; i < KOD_REGION_MAX; i++) {
+        free(detector->queued[i]);
+        detector->queued[i] = NULL;
+    }
+}
+
 void kod_close(kod_detector *detector)
 {
     if (detector == NULL) {
@@ -497,6 +532,7 @@ void kod_close(kod_detector *detector)
     if (detector->to_child >= 0) { (void)close(detector->to_child); }
     if (detector->from_child >= 0) { (void)close(detector->from_child); }
     reap(detector->child);
+    free_queued(detector);
     free(detector->square);
     free(detector);
 }
@@ -521,12 +557,6 @@ uint64_t kod_crops(const kod_detector *detector)
  * aspect and the remainder is left black, so nothing is stretched.  The
  * scale and offsets used are handed back for undoing afterwards.
  */
-typedef struct fit {
-    float scale;      /* source pixels per square pixel */
-    int offset_x;     /* where the image starts inside the square */
-    int offset_y;
-} fit;
-
 static fit scale_into_square(
     const uint8_t *bgra, int width, int height, const kod_rect *from,
     uint8_t *square, int size)
@@ -643,24 +673,89 @@ static bool read_all(int fd, uint8_t *bytes, size_t size, int timeout_ms)
  * normalised square -> square pixels -> minus the letterbox -> times the
  * scale -> plus the region's own origin.  Four steps, one place.
  */
-static bool run_one(
+/* A clock that does not step, for deciding a reply is never coming. */
+static int64_t now_ms(void)
+{
+    struct timespec now;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+        return 0;
+    }
+    return (int64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000;
+}
+
+/*
+ * Every region scaled into its own square, ready to go out one at a time.
+ *
+ * Done up front because it is the cheap half - arithmetic over 320x320 -
+ * and because it is the half that needs the caller's frame.  What the
+ * caller cannot afford is the other half: waiting for the model.
+ */
+static bool scale_all(
     kod_detector *detector, const uint8_t *bgra, int width, int height,
-    const kod_rect *region, int region_index, kod_box *out, size_t capacity,
-    size_t *written)
+    const kod_rect *regions, size_t count)
+{
+    const size_t bytes = (size_t)detector->size * (size_t)detector->size * 4u;
+
+    if (count > KOD_REGION_MAX) {
+        count = KOD_REGION_MAX;
+    }
+    for (size_t i = 0u; i < count; i++) {
+        if (detector->queued[i] == NULL) {
+            /* Lazily: a detector used only whole-frame never pays for a
+             * batch it will not have. */
+            detector->queued[i] = malloc(bytes);
+            if (detector->queued[i] == NULL) {
+                return fail(detector, "out of memory for a crop");
+            }
+        }
+        detector->placements[i] = scale_into_square(
+            bgra, width, height, &regions[i], detector->queued[i],
+            detector->size);
+        detector->regions[i] = regions[i];
+    }
+    detector->frame_width = width;
+    detector->frame_height = height;
+    detector->batch = count;
+    detector->sent = 0u;
+    detector->collected_count = 0u;
+    return true;
+}
+
+/* The next queued crop to the child.  Fast: the child is always reading. */
+static bool send_next(kod_detector *detector)
+{
+    const size_t bytes = (size_t)detector->size * (size_t)detector->size * 4u;
+
+    if (detector->sent >= detector->batch) {
+        return true;
+    }
+    if (!write_all(detector->to_child, detector->queued[detector->sent],
+                   bytes)) {
+        return fail(detector, "the detector stopped reading");
+    }
+    detector->sent++;
+    detector->sent_at_ms = now_ms();
+    return true;
+}
+
+/*
+ * One reply, with every coordinate transform undone.
+ *
+ * normalised square -> square pixels -> minus the letterbox -> times the
+ * scale -> plus the region's own origin.  Four steps, one place.
+ */
+static bool take_reply(kod_detector *detector, int timeout_ms)
 {
     uint8_t reply[KOD_REPLY_BYTES];
     float rows[KOD_REPLY_ROWS][KOD_REPLY_COLUMNS];
-    const size_t bytes = (size_t)detector->size * (size_t)detector->size * 4u;
-    fit placement;
+    const size_t slot = detector->sent - 1u;
+    const fit placement = detector->placements[slot];
+    const kod_rect *region = &detector->regions[slot];
+    const int width = detector->frame_width;
+    const int height = detector->frame_height;
 
-    placement = scale_into_square(bgra, width, height, region,
-                                  detector->square, detector->size);
-    if (!write_all(detector->to_child, detector->square, bytes)) {
-        return fail(detector, "the detector stopped reading");
-    }
-    if (!read_all(detector->from_child, reply, sizeof(reply),
-                  detector->warm ? detector->timeout_ms
-                                 : detector->warmup_ms)) {
+    if (!read_all(detector->from_child, reply, sizeof(reply), timeout_ms)) {
         return fail(detector, detector->warm
                                   ? "the detector did not answer in time"
                                   : "the detector never started (no model?)");
@@ -668,7 +763,8 @@ static bool run_one(
     detector->warm = true;
     detector->crops++;
     (void)memcpy(rows, reply, sizeof(rows));
-    for (size_t i = 0u; i < KOD_REPLY_ROWS && *written < capacity; i++) {
+    for (size_t i = 0u;
+         i < KOD_REPLY_ROWS && detector->collected_count < KOD_BOX_MAX; i++) {
         const int class_id = (int)rows[i][0];
         const float score = rows[i][1];
         float y0 = rows[i][2];
@@ -689,10 +785,10 @@ static bool run_one(
         y0 = y0 * (float)detector->size - (float)placement.offset_y;
         y1 = y1 * (float)detector->size - (float)placement.offset_y;
 
-        box = &out[*written];
+        box = &detector->collected[detector->collected_count];
         box->class_id = class_id;
         box->score = score;
-        box->region = region_index;
+        box->region = (int)slot;
         box->at.x = region->x + (int)(x0 * placement.scale);
         box->at.y = region->y + (int)(y0 * placement.scale);
         box->at.w = (int)((x1 - x0) * placement.scale);
@@ -713,35 +809,7 @@ static bool run_one(
         if (box->at.w <= 0 || box->at.h <= 0) {
             continue;
         }
-        (*written)++;
-    }
-    return true;
-}
-
-bool kod_detect(
-    kod_detector *detector, const uint8_t *bgra, int width, int height,
-    kod_box *out, size_t capacity, size_t *count)
-{
-    kod_rect whole;
-    size_t written = 0u;
-
-    if (count != NULL) {
-        *count = 0u;
-    }
-    if (detector == NULL || detector->broken || bgra == NULL || out == NULL ||
-        width <= 0 || height <= 0) {
-        return false;
-    }
-    whole.x = 0;
-    whole.y = 0;
-    whole.w = width;
-    whole.h = height;
-    if (!run_one(detector, bgra, width, height, &whole, -1, out, capacity,
-                 &written)) {
-        return false;
-    }
-    if (count != NULL) {
-        *count = written;
+        detector->collected_count++;
     }
     return true;
 }
@@ -767,11 +835,52 @@ static float overlap(const kod_rect *a, const kod_rect *b)
     return (float)((double)intersection / (double)combined);
 }
 
-bool kod_detect_regions(
-    kod_detector *detector, const uint8_t *bgra, int width, int height,
-    const kod_rect *regions, size_t region_count, kod_box *out,
-    size_t capacity, size_t *count)
+/*
+ * The same object seen by two overlapping crops is one object.
+ *
+ * Kept within a class and by overlap, and the stronger score wins: a car
+ * that a tight crop scores 0.9 and a wide one scores 0.4 is a car,
+ * reported once, at 0.9.
+ */
+static void dedupe(kod_box *boxes, size_t *count)
 {
+    for (size_t i = 0u; i < *count; i++) {
+        for (size_t j = i + 1u; j < *count;) {
+            if (boxes[i].class_id == boxes[j].class_id &&
+                overlap(&boxes[i].at, &boxes[j].at) > 0.45f) {
+                if (boxes[j].score > boxes[i].score) {
+                    boxes[i] = boxes[j];
+                }
+                boxes[j] = boxes[*count - 1u];
+                (*count)--;
+                continue;
+            }
+            j++;
+        }
+    }
+}
+
+static size_t deliver(kod_detector *detector, kod_box *out, size_t capacity)
+{
+    size_t written = detector->collected_count;
+
+    dedupe(detector->collected, &written);
+    if (written > capacity) {
+        written = capacity;
+    }
+    (void)memcpy(out, detector->collected, written * sizeof(*out));
+    detector->collected_count = 0u;
+    detector->batch = 0u;
+    detector->sent = 0u;
+    detector->busy = false;
+    return written;
+}
+
+bool kod_detect(
+    kod_detector *detector, const uint8_t *bgra, int width, int height,
+    kod_box *out, size_t capacity, size_t *count)
+{
+    kod_rect whole;
     size_t written = 0u;
 
     if (count != NULL) {
@@ -781,37 +890,171 @@ bool kod_detect_regions(
         width <= 0 || height <= 0) {
         return false;
     }
-    if (regions == NULL || region_count == 0u) {
-        return true;   /* nothing moved: not an error, and not a detection */
+    if (detector->busy) {
+        return fail(detector, "a batch is already in flight");
     }
-    for (size_t i = 0u; i < region_count && written < capacity; i++) {
-        if (!run_one(detector, bgra, width, height, &regions[i], (int)i, out,
-                     capacity, &written)) {
-            return false;
-        }
+    whole.x = 0;
+    whole.y = 0;
+    whole.w = width;
+    whole.h = height;
+    if (!scale_all(detector, bgra, width, height, &whole, 1u) ||
+        !send_next(detector) ||
+        !take_reply(detector, detector->warm ? detector->timeout_ms
+                                             : detector->warmup_ms)) {
+        detector->batch = 0u;
+        detector->sent = 0u;
+        return false;
     }
-    /*
-     * The same object seen by two overlapping crops is one object.  Kept
-     * within a class and by overlap, and the stronger score wins: a car
-     * that a tight crop scores 0.9 and a wide one scores 0.4 is a car,
-     * reported once, at 0.9.
-     */
+    written = deliver(detector, out, capacity);
+    /* -1 rather than crop 0: this looked at the whole frame, and a caller
+     * tuning its regions needs to be able to tell those apart. */
     for (size_t i = 0u; i < written; i++) {
-        for (size_t j = i + 1u; j < written;) {
-            if (out[i].class_id == out[j].class_id &&
-                overlap(&out[i].at, &out[j].at) > 0.45f) {
-                if (out[j].score > out[i].score) {
-                    out[i] = out[j];
-                }
-                out[j] = out[written - 1u];
-                written--;
-                continue;
-            }
-            j++;
-        }
+        out[i].region = -1;
     }
     if (count != NULL) {
         *count = written;
+    }
+    return true;
+}
+
+bool kod_detect_regions(
+    kod_detector *detector, const uint8_t *bgra, int width, int height,
+    const kod_rect *regions, size_t region_count, kod_box *out,
+    size_t capacity, size_t *count)
+{
+    if (count != NULL) {
+        *count = 0u;
+    }
+    if (detector == NULL || detector->broken || bgra == NULL || out == NULL ||
+        width <= 0 || height <= 0) {
+        return false;
+    }
+    if (detector->busy) {
+        return fail(detector, "a batch is already in flight");
+    }
+    if (regions == NULL || region_count == 0u) {
+        return true;   /* nothing moved: not an error, and not a detection */
+    }
+    if (!scale_all(detector, bgra, width, height, regions, region_count)) {
+        return false;
+    }
+    while (detector->sent < detector->batch) {
+        if (!send_next(detector) ||
+            !take_reply(detector, detector->warm ? detector->timeout_ms
+                                                 : detector->warmup_ms)) {
+            detector->batch = 0u;
+            detector->sent = 0u;
+            return false;
+        }
+    }
+    if (count != NULL) {
+        *count = deliver(detector, out, capacity);
+    } else {
+        (void)deliver(detector, out, capacity);
+    }
+    return true;
+}
+
+/* ------------------------------ not waiting ------------------------------ */
+
+bool kod_offer(
+    kod_detector *detector, const uint8_t *bgra, int width, int height,
+    const kod_rect *regions, size_t region_count)
+{
+    if (detector == NULL || detector->broken || bgra == NULL || width <= 0 ||
+        height <= 0 || regions == NULL || region_count == 0u) {
+        return false;
+    }
+    if (detector->busy) {
+        /* Not a failure: a caller offering every frame is the expected
+         * use, and "still working on the last one" is the answer most of
+         * the time.  It must not poison the detector's error. */
+        return false;
+    }
+    if (!scale_all(detector, bgra, width, height, regions, region_count)) {
+        return false;
+    }
+    if (!send_next(detector)) {
+        detector->batch = 0u;
+        return false;
+    }
+    detector->busy = true;
+    return true;
+}
+
+bool kod_busy(const kod_detector *detector)
+{
+    return detector != NULL && detector->busy;
+}
+
+bool kod_take(
+    kod_detector *detector, kod_box *out, size_t capacity, size_t *count,
+    bool *done)
+{
+    struct pollfd descriptor;
+    const int limit = detector != NULL && detector->warm
+                          ? detector->timeout_ms
+                          : (detector != NULL ? detector->warmup_ms : 0);
+
+    if (count != NULL) {
+        *count = 0u;
+    }
+    if (done != NULL) {
+        *done = false;
+    }
+    if (detector == NULL || detector->broken || out == NULL) {
+        return false;
+    }
+    if (!detector->busy) {
+        if (done != NULL) {
+            *done = true;
+        }
+        return true;
+    }
+    descriptor.fd = detector->from_child;
+    descriptor.events = POLLIN;
+    descriptor.revents = 0;
+    if (poll(&descriptor, 1u, 0) <= 0) {
+        /*
+         * Nothing yet, which is the ordinary answer.  The deadline is
+         * still enforced here, because a child that died holding a crop
+         * would otherwise leave the detector busy forever and silently
+         * stop detecting - the failure this whole path exists to avoid.
+         */
+        if (now_ms() - detector->sent_at_ms > (int64_t)limit) {
+            detector->busy = false;
+            detector->batch = 0u;
+            detector->sent = 0u;
+            return fail(detector, detector->warm
+                                      ? "the detector did not answer in time"
+                                      : "the detector never started "
+                                        "(no model?)");
+        }
+        return true;
+    }
+    /* Readable, so the reply is on its way and this cannot stall. */
+    if (!take_reply(detector, limit)) {
+        detector->busy = false;
+        detector->batch = 0u;
+        detector->sent = 0u;
+        return false;
+    }
+    if (detector->sent < detector->batch) {
+        if (!send_next(detector)) {
+            detector->busy = false;
+            detector->batch = 0u;
+            detector->sent = 0u;
+            return false;
+        }
+        return true;
+    }
+    if (count != NULL) {
+        *count = deliver(detector, out, capacity);
+    } else {
+        (void)deliver(detector, out, capacity);
+    }
+    if (done != NULL) {
+        *done = true;
     }
     return true;
 }

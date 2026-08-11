@@ -192,6 +192,30 @@ bool kod_detect_regions(
     const kod_rect *regions, size_t region_count, kod_box *out,
     size_t capacity, size_t *count);
 
+/*
+ * The same work, for a caller that cannot stop to wait.
+ *
+ * kod_detect_regions() blocks for as long as the model takes, which is
+ * right for a still image and wrong for anything holding a camera open:
+ * measured on a recorder running three cameras, inference in the frame
+ * loop dropped decoding from 30 frames a second to under 5 - for every
+ * camera, including the ones nothing was moving in.
+ *
+ * kod_offer() takes the crops and sends the first; it returns false when
+ * a batch is already in flight, which is the ordinary answer and does not
+ * set an error.  kod_take() reads a reply if one has arrived and never
+ * waits for one; when it sets `done` the boxes are in `out` and the
+ * detector is free again.  The crops are copied, so the frame they came
+ * from may be released the moment kod_offer() returns.
+ */
+bool kod_offer(
+    kod_detector *detector, const uint8_t *bgra, int width, int height,
+    const kod_rect *regions, size_t region_count);
+bool kod_busy(const kod_detector *detector);
+bool kod_take(
+    kod_detector *detector, kod_box *out, size_t capacity, size_t *count,
+    bool *done);
+
 /* How many crops have been run since opening: the number that says what
  * the motion gate is actually saving. */
 uint64_t kod_crops(const kod_detector *detector);
