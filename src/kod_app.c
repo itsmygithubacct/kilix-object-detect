@@ -212,72 +212,12 @@ uint8_t *kod_grab(const char *source, int *width, int *height,
 
 /* --------------------------------- drawing ------------------------------- */
 
-static void put(uint8_t *bgra, int width, int height, int x, int y,
-                uint32_t colour, float alpha)
-{
-    uint8_t *pixel;
-
-    if (x < 0 || y < 0 || x >= width || y >= height) {
-        return;
-    }
-    pixel = bgra + ((size_t)y * (size_t)width + (size_t)x) * 4u;
-    pixel[0] = (uint8_t)((float)pixel[0] * (1.0f - alpha) +
-                         (float)(colour & 0xFFu) * alpha);
-    pixel[1] = (uint8_t)((float)pixel[1] * (1.0f - alpha) +
-                         (float)((colour >> 8) & 0xFFu) * alpha);
-    pixel[2] = (uint8_t)((float)pixel[2] * (1.0f - alpha) +
-                         (float)((colour >> 16) & 0xFFu) * alpha);
-}
-
-static void outline(uint8_t *bgra, int width, int height, const kod_rect *at,
-                    uint32_t colour, float alpha, int thickness)
-{
-    for (int t = 0; t < thickness; t++) {
-        const int x0 = at->x + t;
-        const int y0 = at->y + t;
-        const int x1 = at->x + at->w - 1 - t;
-        const int y1 = at->y + at->h - 1 - t;
-
-        for (int x = x0; x <= x1; x++) {
-            put(bgra, width, height, x, y0, colour, alpha);
-            put(bgra, width, height, x, y1, colour, alpha);
-        }
-        for (int y = y0; y <= y1; y++) {
-            put(bgra, width, height, x0, y, colour, alpha);
-            put(bgra, width, height, x1, y, colour, alpha);
-        }
-    }
-}
-
-/* Person green, vehicles blue, animals amber: three groups is what the
- * eye can read at a glance, where sixteen colours is a legend. */
-static uint32_t class_colour(int class_id)
-{
-    switch (class_id) {
-    case 0:
-        return 0x60FF80u;
-    case 1: case 2: case 3: case 5: case 7:
-        return 0x60B0FFu;
-    case 14: case 15: case 16: case 17: case 18: case 19: case 21:
-        return 0xFFC040u;
-    default:
-        return 0xFF80C0u;
-    }
-}
-
-void kod_draw_regions(
-    uint8_t *bgra, int width, int height, const kod_rect *regions,
-    size_t count)
-{
-    if (bgra == NULL || regions == NULL) {
-        return;
-    }
-    for (size_t i = 0u; i < count; i++) {
-        outline(bgra, width, height, &regions[i], 0x808080u, 0.35f, 1);
-    }
-}
-
-void kod_draw_boxes(
+/*
+ * Labels only.  The outlines and their colours come from the library, so
+ * a box drawn by the recorder and a box drawn by the analyzer cannot
+ * disagree about what colour a person is.
+ */
+void kod_draw_labels(
     uint8_t *bgra, int width, int height, const kod_box *boxes, size_t count)
 {
     sr_canvas canvas;
@@ -285,16 +225,8 @@ void kod_draw_boxes(
     if (bgra == NULL || boxes == NULL || width <= 0 || height <= 0) {
         return;
     }
-    for (size_t i = 0u; i < count; i++) {
-        outline(bgra, width, height, &boxes[i].at,
-                class_colour(boxes[i].class_id), 1.0f, 2);
-    }
-    /*
-     * Labels through soft-raster, over a wrapped view of the same pixels.
-     * Wrapping rather than copying because the frame is already the right
-     * layout: sr_canvas is 32-bit BGRA in memory, which is exactly what
-     * arrived from the decoder.
-     */
+    /* Wrapped rather than copied: sr_canvas is 32-bit BGRA in memory,
+     * which is exactly what arrived from the decoder. */
     sr_canvas_wrap(&canvas, (uint32_t *)(void *)bgra, width, height);
     for (size_t i = 0u; i < count; i++) {
         const char *label = kod_label(boxes[i].class_id);
@@ -315,7 +247,7 @@ void kod_draw_boxes(
                      (float)sr_text_width_in(SR_FONT_FIXED_8X16, text, 1) + 4.0f,
                      14.0f, 0x000000u, 0.55f);
         sr_text(&canvas, (float)boxes[i].at.x + 2.0f, (float)text_y, text,
-                class_colour(boxes[i].class_id), 1.0f, 1);
+                kod_class_colour(boxes[i].class_id), 1.0f, 1);
     }
 }
 

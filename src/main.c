@@ -186,6 +186,7 @@ static int command_image(const char *path, const settings *options)
     }
     if (options->render != NULL && status == 0) {
         kod_draw_boxes(frame, width, height, boxes, count);
+        kod_draw_labels(frame, width, height, boxes, count);
         if (kod_write_ppm(options->render, frame, width, height)) {
             (void)printf("%s\n", options->render);
         }
@@ -526,6 +527,7 @@ static int command_watch(const char *source, const settings *options)
                              region_count);
         }
         kod_draw_boxes(copy, run.width, run.height, boxes, box_count);
+        kod_draw_labels(copy, run.width, run.height, boxes, box_count);
 
         if (headless) {
             /* The first frame that found something: a picture of an empty

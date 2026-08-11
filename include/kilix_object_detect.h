@@ -196,6 +196,36 @@ bool kod_detect_regions(
  * the motion gate is actually saving. */
 uint64_t kod_crops(const kod_detector *detector);
 
+/* ------------------------------- drawing --------------------------------- */
+
+/*
+ * The colour a class is drawn in: people green, vehicles blue, animals
+ * amber, the rest pink.  Three groups is what the eye reads at a glance,
+ * where sixteen colours is a legend.
+ *
+ * Here rather than in a viewer because every program that draws these
+ * boxes must draw them the same: a colour that means "person" in one
+ * window and "car" in another is worse than no colour.
+ */
+uint32_t kod_class_colour(int class_id);
+
+/*
+ * Outline boxes onto a BGRA frame in place.
+ *
+ * Outlines only, and no text: labels need a font, and a font would put a
+ * rasteriser in a library whose whole claim is C11 and POSIX.  The
+ * outline and its colour are the part that has to agree between callers;
+ * where the label sits is presentation.
+ */
+void kod_draw_boxes(
+    uint8_t *bgra, int width, int height, const kod_box *boxes, size_t count);
+
+/* The crops the detector was given, dimmer than the detections: "why did
+ * it not see that" is usually answered by where the crops were. */
+void kod_draw_regions(
+    uint8_t *bgra, int width, int height, const kod_rect *regions,
+    size_t count);
+
 /*
  * Where a bundled tool is, preferring one that travels with this program:
  * beside the executable, then the checkout's tools/, then PATH.  Public
