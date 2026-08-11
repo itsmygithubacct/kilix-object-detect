@@ -123,9 +123,15 @@ Python. On a Kilix system that is one command:
 kilix install yolo
 ```
 
-which builds the virtualenv, fetches the weights and records where they are.
-Elsewhere, any Python with ultralytics in it will do — point
-`KILIX_OBJECT_DETECTOR` at it.
+which builds the virtualenv with `uv`, fetches the weights and records where
+they are. Elsewhere, any Python with ultralytics in it will do:
+
+```sh
+uv venv ~/.local/gpu_terminal/runtimes/yolo/venv
+uv pip install --python ~/.local/gpu_terminal/runtimes/yolo/venv ultralytics
+export KILIX_OBJECT_DETECTOR="$HOME/.local/gpu_terminal/runtimes/yolo/venv/bin/python \
+                              /usr/local/bin/kilix-look-detect"
+```
 
 ## Dependencies
 
