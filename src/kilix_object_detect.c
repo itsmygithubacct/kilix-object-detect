@@ -607,6 +607,15 @@ uint64_t kod_crops(const kod_detector *detector)
  * `pad` letterboxes: the source is fitted inside the square preserving
  * aspect and the remainder is left black, so nothing is stretched.  The
  * scale and offsets used are handed back for undoing afterwards.
+ *
+ * Two routes to the same bytes, and the scaler test holds them to that.
+ * A rectangle wholly inside the frame - which is every rectangle
+ * kod_regions() or a whole-frame call can produce - takes the fast one:
+ * the column boundaries are computed once instead of once per row, the
+ * per-source-pixel bounds checks go away because the clamp already
+ * proved them, and only the letterbox is cleared because every drawn
+ * pixel is about to be written.  Anything that touches the outside
+ * world takes the careful route, where the checks are real.
  */
 static fit scale_into_square(
     const uint8_t *bgra, int width, int height, const kod_rect *from,
@@ -625,6 +634,94 @@ static fit scale_into_square(
     if (drawn_h > size) { drawn_h = size; }
     placement.offset_x = (size - drawn_w) / 2;
     placement.offset_y = (size - drawn_h) / 2;
+
+    if (from->w > 0 && from->h > 0 && drawn_w > 0 && drawn_h > 0 &&
+        drawn_w <= 4096 && from->x >= 0 && from->y >= 0) {
+        /*
+         * The furthest pixel either loop can read, before entering it.
+         *
+         * Both boundary sequences are non-decreasing, and forcing a span
+         * to at least one pixel can only raise its end to the next
+         * start, so the last span's end bounds them all.  If rounding
+         * pushes it past the frame - a real edge case on edge-hugging
+         * crops - the careful route below handles it.
+         */
+        const int last_x0 =
+            from->x + (int)((float)(drawn_w - 1) * placement.scale);
+        const int last_y0 =
+            from->y + (int)((float)(drawn_h - 1) * placement.scale);
+        int last_x1 = from->x + (int)((float)drawn_w * placement.scale);
+        int last_y1 = from->y + (int)((float)drawn_h * placement.scale);
+
+        if (last_x1 <= last_x0) { last_x1 = last_x0 + 1; }
+        if (last_y1 <= last_y0) { last_y1 = last_y0 + 1; }
+        if (last_x1 <= width && last_y1 <= height) {
+            const size_t row_bytes = (size_t)size * 4u;
+            const size_t left_bytes = (size_t)placement.offset_x * 4u;
+            const size_t right_bytes =
+                (size_t)(size - placement.offset_x - drawn_w) * 4u;
+            int col0[4096];
+            int col1[4096];
+
+            for (int x = 0; x < drawn_w; x++) {
+                const int x0 =
+                    from->x + (int)((float)x * placement.scale);
+                int x1 = from->x + (int)((float)(x + 1) * placement.scale);
+
+                if (x1 <= x0) { x1 = x0 + 1; }
+                col0[x] = x0;
+                col1[x] = x1;
+            }
+            (void)memset(square, 0,
+                         (size_t)placement.offset_y * row_bytes);
+            (void)memset(square + (size_t)(placement.offset_y + drawn_h) *
+                                      row_bytes,
+                         0,
+                         (size_t)(size - placement.offset_y - drawn_h) *
+                             row_bytes);
+            for (int y = 0; y < drawn_h; y++) {
+                const int from_y0 =
+                    from->y + (int)((float)y * placement.scale);
+                int from_y1 =
+                    from->y + (int)((float)(y + 1) * placement.scale);
+                uint8_t *line =
+                    square + (size_t)(y + placement.offset_y) * row_bytes;
+                uint8_t *target = line + left_bytes;
+
+                if (from_y1 <= from_y0) { from_y1 = from_y0 + 1; }
+                (void)memset(line, 0, left_bytes);
+                (void)memset(line + left_bytes + (size_t)drawn_w * 4u, 0,
+                             right_bytes);
+                for (int x = 0; x < drawn_w; x++) {
+                    uint32_t blue = 0u;
+                    uint32_t green = 0u;
+                    uint32_t red = 0u;
+                    uint32_t taken = 0u;
+
+                    for (int sy_at = from_y0; sy_at < from_y1; sy_at++) {
+                        const uint8_t *pixel =
+                            bgra + ((size_t)sy_at * (size_t)width +
+                                    (size_t)col0[x]) * 4u;
+
+                        for (int sx_at = col0[x]; sx_at < col1[x];
+                             sx_at++) {
+                            blue += pixel[0];
+                            green += pixel[1];
+                            red += pixel[2];
+                            pixel += 4;
+                            taken++;
+                        }
+                    }
+                    target[0] = (uint8_t)(blue / taken);
+                    target[1] = (uint8_t)(green / taken);
+                    target[2] = (uint8_t)(red / taken);
+                    target[3] = 0xFFu;
+                    target += 4;
+                }
+            }
+            return placement;
+        }
+    }
 
     (void)memset(square, 0, (size_t)size * (size_t)size * 4u);
     for (int y = 0; y < drawn_h; y++) {
