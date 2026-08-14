@@ -58,8 +58,15 @@ extern "C" {
 
 /* Boxes returned in one call, across every region. */
 #define KOD_BOX_MAX 32
-/* Crops taken from one frame.  Beyond this the smallest are dropped and
- * counted, because an unbounded region list is an unbounded frame cost. */
+/*
+ * Crops in flight at once.  kod_regions() keeps a frame within this by
+ * dropping the smallest and counting them, because an unbounded region
+ * list is an unbounded frame cost.  A longer list handed straight to
+ * kod_detect_regions() is still inferred in full, this many at a time;
+ * kod_offer() takes only the first KOD_REGION_MAX, because a caller that
+ * cannot wait cannot be handed a second round either - route the list
+ * through kod_regions() to decide what a capped batch keeps.
+ */
 #define KOD_REGION_MAX 8
 
 typedef struct kod_rect {
@@ -206,7 +213,9 @@ bool kod_detect_regions(
  * set an error.  kod_take() reads a reply if one has arrived and never
  * waits for one; when it sets `done` the boxes are in `out` and the
  * detector is free again.  The crops are copied, so the frame they came
- * from may be released the moment kod_offer() returns.
+ * from may be released the moment kod_offer() returns.  At most
+ * KOD_REGION_MAX regions are taken per offer - see the note at its
+ * definition.
  */
 bool kod_offer(
     kod_detector *detector, const uint8_t *bgra, int width, int height,
