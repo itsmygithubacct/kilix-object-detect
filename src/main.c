@@ -602,6 +602,48 @@ static int command_classes(void)
         }                                                                     \
     } while (false)
 
+/*
+ * The render path's deliverable, byte for byte: a P6 header, then RGB
+ * triplets top-left first with the alpha dropped.  Pinned here because a
+ * PPM that is almost right opens fine in one viewer and not another,
+ * and --render is how this program is checked on machines that cannot
+ * show a window.
+ */
+static bool ppm_round_trips(void)
+{
+    static const uint8_t bgra[16] = {
+        0x01, 0x02, 0x03, 0xFF,  0x11, 0x12, 0x13, 0x80,
+        0x21, 0x22, 0x23, 0x00,  0xFF, 0x00, 0x7F, 0xFF
+    };
+    static const uint8_t expected[] = {
+        'P', '6', '\n', '2', ' ', '2', '\n', '2', '5', '5', '\n',
+        0x03, 0x02, 0x01,  0x13, 0x12, 0x11,
+        0x23, 0x22, 0x21,  0x7F, 0x00, 0xFF
+    };
+    const char *tmpdir = getenv("TMPDIR");
+    char path[512];
+    uint8_t written[64];
+    size_t got;
+    FILE *file;
+
+    (void)snprintf(path, sizeof(path), "%s/kilix-look-selftest-%ld.ppm",
+                   tmpdir != NULL && tmpdir[0] != '\0' ? tmpdir : "/tmp",
+                   (long)getpid());
+    if (!kod_write_ppm(path, bgra, 2, 2)) {
+        return false;
+    }
+    file = fopen(path, "rb");
+    if (file == NULL) {
+        (void)remove(path);
+        return false;
+    }
+    got = fread(written, 1u, sizeof(written), file);
+    (void)fclose(file);
+    (void)remove(path);
+    return got == sizeof(expected) &&
+           memcmp(written, expected, sizeof(expected)) == 0;
+}
+
 static int selftest(void)
 {
     char safe[256];
@@ -639,6 +681,8 @@ static int selftest(void)
     count = kod_regions(motion, 2u, 1920, 1080, 320, regions, KOD_REGION_MAX,
                         NULL);
     TEST("two boxes far apart are two crops", count == 2u);
+
+    TEST("a ppm is written byte for byte", ppm_round_trips());
 
     (void)printf("selftest passed\n");
     return 0;
