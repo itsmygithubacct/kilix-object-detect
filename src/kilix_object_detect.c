@@ -707,15 +707,41 @@ static bool write_all(int fd, const uint8_t *bytes, size_t size)
     return true;
 }
 
+/* A clock that does not step, for deciding a reply is never coming. */
+static int64_t now_ms(void)
+{
+    struct timespec now;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+        return 0;
+    }
+    return (int64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000;
+}
+
+/*
+ * The timeout is a deadline on the whole read, not on each piece of it.
+ *
+ * Restarting the budget at every chunk would let a detector that drips a
+ * byte per interval keep a "bounded" wait alive for as long as it liked -
+ * a dying ssh connection to a remote detector trickles exactly like that.
+ * Whatever has already arrived when the deadline passes still counts, so
+ * a reply that is sitting in the pipe complete is never refused.
+ */
 static bool read_all(int fd, uint8_t *bytes, size_t size, int timeout_ms)
 {
+    const int64_t deadline = now_ms() + timeout_ms;
     size_t offset = 0u;
 
     while (offset < size) {
         struct pollfd descriptor = {fd, POLLIN, 0};
-        const int ready = poll(&descriptor, 1u, timeout_ms);
+        int64_t remaining = deadline - now_ms();
+        int ready;
         ssize_t got;
 
+        if (remaining < 0) {
+            remaining = 0;
+        }
+        ready = poll(&descriptor, 1u, (int)remaining);
         if (ready <= 0) {
             return false;
         }
@@ -730,23 +756,6 @@ static bool read_all(int fd, uint8_t *bytes, size_t size, int timeout_ms)
         return false;
     }
     return true;
-}
-
-/*
- * One crop through the model, with every coordinate transform undone.
- *
- * normalised square -> square pixels -> minus the letterbox -> times the
- * scale -> plus the region's own origin.  Four steps, one place.
- */
-/* A clock that does not step, for deciding a reply is never coming. */
-static int64_t now_ms(void)
-{
-    struct timespec now;
-
-    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
-        return 0;
-    }
-    return (int64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000;
 }
 
 /*
@@ -1097,12 +1106,22 @@ bool kod_take(
         }
         return true;
     }
-    /* Readable, so the reply is on its way and this cannot stall. */
-    if (!take_reply(detector, limit)) {
-        detector->busy = false;
-        detector->batch = 0u;
-        detector->sent = 0u;
-        return false;
+    /* Readable, so the reply is on its way and this cannot stall.  What
+     * is left of the deadline is what it gets: the time spent polling
+     * already came out of the same budget. */
+    {
+        int64_t remaining =
+            (int64_t)limit - (now_ms() - detector->sent_at_ms);
+
+        if (remaining < 0) {
+            remaining = 0;
+        }
+        if (!take_reply(detector, (int)remaining)) {
+            detector->busy = false;
+            detector->batch = 0u;
+            detector->sent = 0u;
+            return false;
+        }
     }
     if (detector->sent < detector->batch) {
         if (!send_next(detector)) {

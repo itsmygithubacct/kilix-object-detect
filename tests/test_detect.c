@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #define CHECK(condition)                                                      \
     do {                                                                      \
@@ -45,6 +46,15 @@ static bool start(kod_detector **detector, float min_score)
 static uint8_t *blank(void)
 {
     return calloc((size_t)W * (size_t)H * 4u, 1u);
+}
+
+static long elapsed_ms_since(const struct timespec *from)
+{
+    struct timespec now;
+
+    (void)clock_gettime(CLOCK_MONOTONIC, &now);
+    return (now.tv_sec - from->tv_sec) * 1000 +
+           (now.tv_nsec - from->tv_nsec) / 1000000;
 }
 
 /*
@@ -354,6 +364,42 @@ static bool test_offering_does_not_wait(void)
 }
 
 /*
+ * The reply timeout is a deadline on the whole reply.
+ *
+ * A detector that dribbles its reply out a slice at a time keeps every
+ * poll alive, and a timeout restarted per slice would wait 480 times the
+ * budget for a 480-byte reply.  Six slices, 400ms apart, against a one
+ * second budget: a per-slice timeout happily waits 2.4 seconds and
+ * succeeds; a real deadline gives up at one.
+ */
+static bool test_the_reply_deadline_is_total(void)
+{
+    kod_detector *detector = NULL;
+    kod_options options;
+    uint8_t *frame = blank();
+    kod_box boxes[KOD_BOX_MAX];
+    size_t count = 0u;
+    struct timespec started;
+
+    CHECK(frame != NULL);
+    CHECK(setenv("FAKE_DRIP", "6:400", 1) == 0);
+    kod_options_init(&options);
+    options.argv = FAKE;
+    options.size = SIZE;
+    options.timeout_seconds = 1;
+    options.warmup_seconds = 1;
+    CHECK(kod_open(&detector, &options));
+    (void)clock_gettime(CLOCK_MONOTONIC, &started);
+    CHECK(!kod_detect(detector, frame, W, H, boxes, KOD_BOX_MAX, &count));
+    CHECK(kod_error(detector) != NULL);
+    CHECK(elapsed_ms_since(&started) < 2000);
+    kod_close(detector);
+    CHECK(unsetenv("FAKE_DRIP") == 0);
+    free(frame);
+    return true;
+}
+
+/*
  * A blocking call while a batch is in flight is refused, with a reason -
  * and nothing more.  The batch it collided with is healthy, so refusing
  * it must not disable the detector: the batch still completes, and the
@@ -444,6 +490,7 @@ int main(void)
          test_a_dead_detector_is_survivable},
         {"rejections", test_rejections},
         {"offering does not wait", test_offering_does_not_wait},
+        {"the reply deadline is total", test_the_reply_deadline_is_total},
         {"a busy refusal does not poison",
          test_a_busy_refusal_does_not_poison},
         {"the frame may be released",
