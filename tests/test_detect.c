@@ -202,6 +202,54 @@ static bool test_no_regions_costs_nothing(void)
     return true;
 }
 
+/*
+ * A list longer than one batch is inferred in full.
+ *
+ * The batch arrays hold eight crops, and a caller building its own
+ * region list is owed all of it - a truncated tail would read as
+ * "nothing was in those", which is the silent kind of wrong.  Ten
+ * regions that cannot merge, and every one must come back under its own
+ * index, in its own place.
+ */
+static bool test_every_region_is_inferred(void)
+{
+    kod_detector *detector = NULL;
+    uint8_t *frame = blank();
+    kod_box boxes[KOD_BOX_MAX];
+    kod_rect regions[10];
+    bool seen[10] = {false};
+    size_t count = 0u;
+
+    CHECK(frame != NULL);
+    CHECK(start(&detector, 0.1f));
+    for (int i = 0; i < 10; i++) {
+        regions[i].x = (i % 5) * 128;
+        regions[i].y = (i / 5) * 180;
+        regions[i].w = 100;
+        regions[i].h = 100;
+    }
+    CHECK(kod_detect_regions(detector, frame, W, H, regions, 10u, boxes,
+                             KOD_BOX_MAX, &count));
+    CHECK(kod_crops(detector) == 10u);
+    CHECK(count == 10u);
+    for (size_t i = 0u; i < count; i++) {
+        const kod_rect *from;
+
+        CHECK(boxes[i].region >= 0 && boxes[i].region < 10);
+        CHECK(!seen[boxes[i].region]);
+        seen[boxes[i].region] = true;
+        /* And inside the region that found it, which pins the mapping
+         * for the rounds after the first. */
+        from = &regions[boxes[i].region];
+        CHECK(boxes[i].at.x >= from->x && boxes[i].at.y >= from->y);
+        CHECK(boxes[i].at.x + boxes[i].at.w <= from->x + from->w);
+        CHECK(boxes[i].at.y + boxes[i].at.h <= from->y + from->h);
+    }
+    kod_close(detector);
+    free(frame);
+    return true;
+}
+
 static bool test_the_threshold_and_the_allowlist(void)
 {
     kod_detector *detector = NULL;
@@ -484,6 +532,7 @@ int main(void)
         {"overlapping crops report once",
          test_overlapping_crops_report_once},
         {"no regions costs nothing", test_no_regions_costs_nothing},
+        {"every region is inferred", test_every_region_is_inferred},
         {"the threshold and the allowlist",
          test_the_threshold_and_the_allowlist},
         {"a dead detector is survivable",

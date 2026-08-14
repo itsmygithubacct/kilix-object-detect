@@ -1009,16 +1009,46 @@ bool kod_detect_regions(
     if (regions == NULL || region_count == 0u) {
         return true;   /* nothing moved: not an error, and not a detection */
     }
-    if (!scale_all(detector, bgra, width, height, regions, region_count)) {
-        return false;
-    }
-    while (detector->sent < detector->batch) {
-        if (!send_next(detector) ||
-            !take_reply(detector, detector->warm ? detector->timeout_ms
-                                                 : detector->warmup_ms)) {
-            detector->batch = 0u;
-            detector->sent = 0u;
-            return false;
+    /*
+     * However many regions arrive, every one of them is inferred.
+     *
+     * The batch arrays hold KOD_REGION_MAX crops, so a longer list is
+     * taken that many at a time.  Truncating instead would silently drop
+     * whichever regions happened to come last - and this call can afford
+     * to go around again, because waiting is what it does.
+     */
+    {
+        size_t begun = 0u;
+        size_t kept = 0u;
+
+        while (begun < region_count) {
+            size_t chunk = region_count - begun;
+
+            if (chunk > KOD_REGION_MAX) {
+                chunk = KOD_REGION_MAX;
+            }
+            if (!scale_all(detector, bgra, width, height, regions + begun,
+                           chunk)) {
+                return false;
+            }
+            detector->collected_count = kept;   /* earlier rounds stay */
+            while (detector->sent < detector->batch) {
+                if (!send_next(detector) ||
+                    !take_reply(detector, detector->warm
+                                              ? detector->timeout_ms
+                                              : detector->warmup_ms)) {
+                    detector->batch = 0u;
+                    detector->sent = 0u;
+                    return false;
+                }
+            }
+            /* The replies name crops by their place in this round; the
+             * caller knows them by their place in the whole list. */
+            for (size_t i = kept; i < detector->collected_count; i++) {
+                detector->collected[i].region += (int)begun;
+            }
+            kept = detector->collected_count;
+            begun += chunk;
         }
     }
     if (count != NULL) {
