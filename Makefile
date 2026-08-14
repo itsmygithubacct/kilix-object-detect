@@ -61,7 +61,8 @@ LIB_OBJECTS := $(BUILD_DIR)/kilix_object_detect.o
 STATIC_LIB := $(BUILD_DIR)/lib$(PROJECT).a
 COMMAND := $(BUILD_DIR)/$(COMMAND_NAME)
 
-TESTS := $(BUILD_DIR)/test-regions $(BUILD_DIR)/test-detect
+TESTS := $(BUILD_DIR)/test-regions $(BUILD_DIR)/test-detect \
+	$(BUILD_DIR)/test-scaler
 
 TOOLS := tools/kilix-look-detect
 
