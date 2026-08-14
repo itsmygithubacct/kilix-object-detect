@@ -75,7 +75,7 @@ $(BUILD_DIR) $(BUILD_DIR)/vendor:
 	mkdir -p $@
 
 $(BUILD_DIR)/%.o: src/%.c | $(BUILD_DIR)
-	$(CC) $(CPPFLAGS) $(CMD_CPPFLAGS) $(CFLAGS) -c $< -o $@
+	$(CC) $(CPPFLAGS) $(CMD_CPPFLAGS) $(CFLAGS) -MMD -MP -c $< -o $@
 
 $(STATIC_LIB): $(LIB_OBJECTS)
 	$(AR) rcs $@ $^
@@ -83,7 +83,7 @@ $(STATIC_LIB): $(LIB_OBJECTS)
 vpath %.c $(sort $(dir $(CMD_VENDOR_SOURCES)))
 
 $(BUILD_DIR)/vendor/%.o: %.c | $(BUILD_DIR)/vendor
-	$(CC) $(CPPFLAGS) $(CMD_CPPFLAGS) $(VENDOR_CFLAGS) -c $< -o $@
+	$(CC) $(CPPFLAGS) $(CMD_CPPFLAGS) $(VENDOR_CFLAGS) -MMD -MP -c $< -o $@
 
 $(COMMAND): $(CMD_OBJECTS) $(STATIC_LIB) $(CMD_VENDOR_OBJECTS) | $(BUILD_DIR)
 	@test -f $(RTSP)/include/kilix_rtsp.h || { \
@@ -93,7 +93,7 @@ $(COMMAND): $(CMD_OBJECTS) $(STATIC_LIB) $(CMD_VENDOR_OBJECTS) | $(BUILD_DIR)
 		$(CMD_LDLIBS) -o $@
 
 $(BUILD_DIR)/test-%: tests/test_%.c $(STATIC_LIB) | $(BUILD_DIR)
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) $^ -lm -o $@
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -MMD -MP $^ -lm -o $@
 
 test: $(TESTS) $(COMMAND)
 	@set -e; for binary in $(TESTS); do \
@@ -120,3 +120,9 @@ install: all
 
 clean:
 	rm -rf $(BUILD_DIR)
+
+# What the compiler recorded each object actually included, so editing a
+# header rebuilds its users instead of leaving stale objects for the
+# tests to measure.
+-include $(CMD_OBJECTS:.o=.d) $(CMD_VENDOR_OBJECTS:.o=.d) \
+	$(LIB_OBJECTS:.o=.d) $(TESTS:=.d)
