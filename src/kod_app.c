@@ -254,20 +254,16 @@ void kod_draw_labels(
 bool kod_write_ppm(const char *path, const uint8_t *bgra, int width,
                    int height)
 {
-    FILE *file;
+    sr_canvas canvas;
 
     if (path == NULL || bgra == NULL) {
         return false;
     }
-    file = fopen(path, "wb");
-    if (file == NULL) {
-        return false;
-    }
-    (void)fprintf(file, "P6\n%d %d\n255\n", width, height);
-    for (int i = 0; i < width * height; i++) {
-        (void)fputc(bgra[i * 4 + 2], file);
-        (void)fputc(bgra[i * 4 + 1], file);
-        (void)fputc(bgra[i * 4 + 0], file);
-    }
-    return fclose(file) == 0;
+    /* Wrapped rather than copied, exactly as the label drawing does: the
+     * raster library's canvas is 32-bit BGRA in memory, which is what
+     * arrived from the decoder, and its writer already produces the P6
+     * bytes the selftest pins - in whole chunks rather than a call per
+     * channel. */
+    sr_canvas_wrap(&canvas, (uint32_t *)(void *)bgra, width, height);
+    return sr_write_ppm(&canvas, path);
 }
