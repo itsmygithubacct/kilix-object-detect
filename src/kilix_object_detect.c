@@ -138,6 +138,21 @@ static bool fail(kod_detector *detector, const char *reason)
     return false;
 }
 
+/*
+ * Refused, not broken.  A blocking call that arrives while a batch is in
+ * flight has asked at a bad moment, but the batch itself is healthy and
+ * kod_take() will complete it; recording the refusal as a fault would
+ * disable a working detector until close.  The reason is still written,
+ * so a caller wondering why the call returned false can ask.
+ */
+static bool refuse(kod_detector *detector, const char *reason)
+{
+    if (detector != NULL) {
+        (void)snprintf(detector->error, sizeof(detector->error), "%s", reason);
+    }
+    return false;
+}
+
 const char *kod_error(const kod_detector *detector)
 {
     if (detector == NULL || detector->error[0] == '\0') {
@@ -941,7 +956,7 @@ bool kod_detect(
         return false;
     }
     if (detector->busy) {
-        return fail(detector, "a batch is already in flight");
+        return refuse(detector, "a batch is already in flight");
     }
     whole.x = 0;
     whole.y = 0;
@@ -980,7 +995,7 @@ bool kod_detect_regions(
         return false;
     }
     if (detector->busy) {
-        return fail(detector, "a batch is already in flight");
+        return refuse(detector, "a batch is already in flight");
     }
     if (regions == NULL || region_count == 0u) {
         return true;   /* nothing moved: not an error, and not a detection */

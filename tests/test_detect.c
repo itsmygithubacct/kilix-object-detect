@@ -353,6 +353,49 @@ static bool test_offering_does_not_wait(void)
     return true;
 }
 
+/*
+ * A blocking call while a batch is in flight is refused, with a reason -
+ * and nothing more.  The batch it collided with is healthy, so refusing
+ * it must not disable the detector: the batch still completes, and the
+ * blocking calls work again once it has.
+ */
+static bool test_a_busy_refusal_does_not_poison(void)
+{
+    kod_detector *detector = NULL;
+    uint8_t *frame = blank();
+    kod_box boxes[KOD_BOX_MAX];
+    kod_rect regions[2];
+    size_t count = 0u;
+    bool done = false;
+
+    CHECK(frame != NULL);
+    CHECK(start(&detector, 0.1f));
+    regions[0].x = 0;    regions[0].y = 0;   regions[0].w = 200;
+    regions[0].h = 200;
+    regions[1].x = 400;  regions[1].y = 100; regions[1].w = 160;
+    regions[1].h = 160;
+    CHECK(kod_offer(detector, frame, W, H, regions, 2u));
+    CHECK(kod_busy(detector));
+
+    CHECK(!kod_detect(detector, frame, W, H, boxes, KOD_BOX_MAX, &count));
+    CHECK(kod_error(detector) != NULL);
+    CHECK(!kod_detect_regions(detector, frame, W, H, regions, 2u, boxes,
+                              KOD_BOX_MAX, &count));
+
+    /* The batch it refused for is still in flight and still completes. */
+    while (!done) {
+        CHECK(kod_take(detector, boxes, KOD_BOX_MAX, &count, &done));
+    }
+    CHECK(count > 0u);
+
+    /* And now that the detector is free, blocking calls work. */
+    CHECK(kod_detect(detector, frame, W, H, boxes, KOD_BOX_MAX, &count));
+    CHECK(count > 0u);
+    kod_close(detector);
+    free(frame);
+    return true;
+}
+
 /* The frame may go away the moment it has been offered. */
 static bool test_the_frame_may_be_released(void)
 {
@@ -401,6 +444,8 @@ int main(void)
          test_a_dead_detector_is_survivable},
         {"rejections", test_rejections},
         {"offering does not wait", test_offering_does_not_wait},
+        {"a busy refusal does not poison",
+         test_a_busy_refusal_does_not_poison},
         {"the frame may be released",
          test_the_frame_may_be_released}
     };
