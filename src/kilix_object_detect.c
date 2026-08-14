@@ -45,7 +45,6 @@ struct kod_detector {
     int warmup_ms;
     bool warm;
     bool broken;
-    uint8_t *square;      /* size * size * 4, reused every call */
     uint64_t crops;
     char error[ERROR_MAX];
 
@@ -418,12 +417,6 @@ bool kod_open(kod_detector **out, const kod_options *options)
     }
     detector->to_child = -1;
     detector->from_child = -1;
-    detector->square = malloc((size_t)detector->size *
-                              (size_t)detector->size * 4u);
-    if (detector->square == NULL) {
-        free(detector);
-        return false;
-    }
 
     kod_bundled_tool(KOD_DETECTOR_NAME, bundled, sizeof(bundled));
     fallback[0] = bundled;
@@ -444,19 +437,16 @@ bool kod_open(kod_detector **out, const kod_options *options)
             words++;
         }
         if (words == 0u || words > KOD_ARGV_MAX) {
-            free(detector->square);
             free(detector);
             return false;
         }
     }
     if (pipe(to_child) != 0) {
-        free(detector->square);
         free(detector);
         return false;
     }
     if (pipe(from_child) != 0) {
         (void)close(to_child[0]); (void)close(to_child[1]);
-        free(detector->square);
         free(detector);
         return false;
     }
@@ -468,7 +458,6 @@ bool kod_open(kod_detector **out, const kod_options *options)
     if (pipe(status) != 0) {
         (void)close(to_child[0]); (void)close(to_child[1]);
         (void)close(from_child[0]); (void)close(from_child[1]);
-        free(detector->square);
         free(detector);
         return false;
     }
@@ -478,7 +467,6 @@ bool kod_open(kod_detector **out, const kod_options *options)
         (void)close(to_child[0]); (void)close(to_child[1]);
         (void)close(from_child[0]); (void)close(from_child[1]);
         (void)close(status[0]); (void)close(status[1]);
-        free(detector->square);
         free(detector);
         return false;
     }
@@ -541,7 +529,6 @@ bool kod_open(kod_detector **out, const kod_options *options)
             (void)close(to_child[1]);
             (void)close(from_child[0]);
             reap(detector->child);
-            free(detector->square);
             free(detector);
             return false;
         }
@@ -598,7 +585,6 @@ void kod_close(kod_detector *detector)
     if (detector->from_child >= 0) { (void)close(detector->from_child); }
     reap(detector->child);
     free_queued(detector);
-    free(detector->square);
     free(detector);
 }
 
