@@ -11,6 +11,7 @@
 
 #include "kilix_object_detect.h"
 
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -28,6 +29,10 @@
 #define W 640
 #define H 360
 #define SIZE 128
+
+#ifndef KOD_TEST_BUILD_DIR
+#define KOD_TEST_BUILD_DIR "build"
+#endif
 
 static const char *const FAKE[] = {"python3", "tests/fake_detect.py", NULL};
 
@@ -55,6 +60,18 @@ static long elapsed_ms_since(const struct timespec *from)
     (void)clock_gettime(CLOCK_MONOTONIC, &now);
     return (now.tv_sec - from->tv_sec) * 1000 +
            (now.tv_nsec - from->tv_nsec) / 1000000;
+}
+
+static bool wait_one_millisecond(void)
+{
+    struct timespec remaining = {.tv_sec = 0, .tv_nsec = 1000000L};
+
+    while (nanosleep(&remaining, &remaining) != 0) {
+        if (errno != EINTR) {
+            return false;
+        }
+    }
+    return true;
 }
 
 /*
@@ -279,7 +296,8 @@ static bool test_the_threshold_and_the_allowlist(void)
 static bool test_a_dead_detector_is_survivable(void)
 {
     static const char *const MISSING[] = {"kilix-no-such-detector", NULL};
-    static const char *const LOG = "build/test-detect-child.log";
+    static const char *const LOG =
+        KOD_TEST_BUILD_DIR "/test-detect-child.log";
     kod_options options;
     kod_detector *detector = NULL;
     uint8_t *frame = blank();
@@ -363,7 +381,7 @@ static bool test_offering_does_not_wait(void)
     size_t async_count = 0u;
     size_t sync_count = 0u;
     bool done = false;
-    int spins = 0;
+    struct timespec started;
 
     CHECK(frame != NULL);
     CHECK(start(&detector, 0.1f));
@@ -379,10 +397,13 @@ static bool test_offering_does_not_wait(void)
     CHECK(!kod_offer(detector, frame, W, H, regions, 2u));
     CHECK(kod_error(detector) == NULL);
 
-    while (!done && spins < 100000) {
+    CHECK(clock_gettime(CLOCK_MONOTONIC, &started) == 0);
+    while (!done && elapsed_ms_since(&started) < 10000L) {
         CHECK(kod_take(detector, async_boxes, KOD_BOX_MAX, &async_count,
                        &done));
-        spins++;
+        if (!done) {
+            CHECK(wait_one_millisecond());
+        }
     }
     CHECK(done);
     CHECK(!kod_busy(detector));
@@ -393,10 +414,6 @@ static bool test_offering_does_not_wait(void)
     CHECK(done);
 
     /* ...and the same regions through the blocking call agree. */
-    CHECK(kod_offer(detector, frame, W, H, regions, 2u) || true);
-    while (kod_busy(detector)) {
-        CHECK(kod_take(detector, sync_boxes, KOD_BOX_MAX, &sync_count, &done));
-    }
     CHECK(kod_detect_regions(detector, frame, W, H, regions, 2u, sync_boxes,
                              KOD_BOX_MAX, &sync_count));
     CHECK(sync_count == async_count);
