@@ -3,6 +3,7 @@ COMMAND_NAME := kilix-look
 BUILD_DIR ?= build
 PREFIX ?= /usr/local
 DESTDIR ?=
+F120_PREFIX ?=
 
 CC ?= cc
 AR ?= ar
@@ -15,12 +16,11 @@ WARNINGS := \
 CFLAGS ?= -O2 -g
 override CFLAGS += -std=c11 -fPIC $(WARNINGS)
 
-# Vendored and pinned.  The library needs none of these - it is a
-# subprocess and some arithmetic - so they are all below this line, where
-# the command is.  The terminal stack comes through kilix-rtsp's own
-# closure rather than being pinned twice.
+# Command dependencies.  The library needs none of these - it is a subprocess
+# and some arithmetic - so they are all below this line, where the command is.
+# The terminal stack comes through kilix-rtsp's own closure rather than being
+# pinned twice.  Motion detection comes from an immutable F120 public prefix.
 RTSP := third_party/kilix-rtsp
-MOTION := third_party/kilix-motion-detect
 SOUND := third_party/kilix-sound-detect
 KTS := $(RTSP)/third_party/kitty-terminal-session
 KFB := $(KTS)/third_party/kitty-framebuffer
@@ -28,7 +28,22 @@ KIN := $(KTS)/third_party/kitty-input
 KKB := $(KIN)/third_party/kitty_keyboard
 SR := $(RTSP)/third_party/soft-raster
 
-CMD_CPPFLAGS := -I$(RTSP)/include -I$(MOTION)/include -I$(SOUND)/include \
+MOTION_CPPFLAGS := -I$(F120_PREFIX)/include
+MOTION_HEADER := $(F120_PREFIX)/include/kilix_motion_detect.h
+MOTION_LINK_INPUTS := $(F120_PREFIX)/lib/libkilix-motion-detect.a
+ifneq ($(MAKECMDGOALS),clean)
+ifeq ($(strip $(F120_PREFIX)),)
+$(error F120_PREFIX is required)
+endif
+ifeq ($(wildcard $(MOTION_HEADER)),)
+$(error F120 public header is missing: $(MOTION_HEADER))
+endif
+ifeq ($(wildcard $(MOTION_LINK_INPUTS)),)
+$(error F120 static archive is missing: $(MOTION_LINK_INPUTS))
+endif
+endif
+
+CMD_CPPFLAGS := -I$(RTSP)/include $(MOTION_CPPFLAGS) -I$(SOUND)/include \
 	-I$(KTS)/include -I$(KFB)/include -I$(KIN)/include -I$(KKB)/include \
 	-I$(SR)/include -Isrc
 CMD_LDLIBS := -lm -lpthread -lz
@@ -41,7 +56,6 @@ CMD_VENDOR_SOURCES := \
 	$(RTSP)/src/krtsp_paths.c \
 	$(RTSP)/src/krtsp_config.c \
 	$(RTSP)/src/krtsp_exec.c \
-	$(MOTION)/src/kilix_motion_detect.c \
 	$(SOUND)/src/kilix_sound_detect.c \
 	$(KTS)/src/kitty_terminal_session.c \
 	$(KFB)/src/kitty_framebuffer.c \
@@ -77,6 +91,8 @@ $(BUILD_DIR) $(BUILD_DIR)/vendor:
 $(BUILD_DIR)/%.o: src/%.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CMD_CPPFLAGS) $(CFLAGS) -MMD -MP -c $< -o $@
 
+$(CMD_OBJECTS): $(MOTION_HEADER)
+
 $(STATIC_LIB): $(LIB_OBJECTS)
 	$(AR) rcs $@ $^
 
@@ -85,7 +101,8 @@ vpath %.c $(sort $(dir $(CMD_VENDOR_SOURCES)))
 $(BUILD_DIR)/vendor/%.o: %.c | $(BUILD_DIR)/vendor
 	$(CC) $(CPPFLAGS) $(CMD_CPPFLAGS) $(VENDOR_CFLAGS) -MMD -MP -c $< -o $@
 
-$(COMMAND): $(CMD_OBJECTS) $(STATIC_LIB) $(CMD_VENDOR_OBJECTS) | $(BUILD_DIR)
+$(COMMAND): $(CMD_OBJECTS) $(STATIC_LIB) $(CMD_VENDOR_OBJECTS) \
+	$(MOTION_LINK_INPUTS) | $(BUILD_DIR)
 	@test -f $(RTSP)/include/kilix_rtsp.h || { \
 		printf 'submodules missing; run: git submodule update --init --recursive\n' >&2; \
 		exit 1; }
