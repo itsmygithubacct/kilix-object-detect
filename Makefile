@@ -93,7 +93,8 @@ $(COMMAND): $(CMD_OBJECTS) $(STATIC_LIB) $(CMD_VENDOR_OBJECTS) | $(BUILD_DIR)
 		$(CMD_LDLIBS) -o $@
 
 $(BUILD_DIR)/test-%: tests/test_%.c $(STATIC_LIB) | $(BUILD_DIR)
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -MMD -MP $^ -lm -o $@
+	$(CC) $(CPPFLAGS) -DKOD_TEST_BUILD_DIR='"$(BUILD_DIR)"' \
+		$(CFLAGS) $(LDFLAGS) -MMD -MP $^ -lm -o $@
 
 test: $(TESTS) $(COMMAND)
 	@set -e; for binary in $(TESTS); do \
