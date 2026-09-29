@@ -28,18 +28,27 @@ KIN := $(KTS)/third_party/kitty-input
 KKB := $(KIN)/third_party/kitty_keyboard
 SR := $(RTSP)/third_party/soft-raster
 
+# An explicit F120_PREFIX is used as given and must already hold the header
+# and archive. Without one - a catalog or first-use build, where nothing has
+# staged the provider - the pinned submodule is staged into the same layout
+# under the build directory, so the command still links only public F120
+# outputs.
+MOTION := third_party/kilix-motion-detect
+MOTION_STAGED := $(strip $(F120_PREFIX))
+ifeq ($(MOTION_STAGED),)
+F120_PREFIX := $(abspath $(BUILD_DIR))/f120-motion
+endif
 MOTION_CPPFLAGS := -I$(F120_PREFIX)/include
 MOTION_HEADER := $(F120_PREFIX)/include/kilix_motion_detect.h
 MOTION_LINK_INPUTS := $(F120_PREFIX)/lib/libkilix-motion-detect.a
 ifneq ($(MAKECMDGOALS),clean)
-ifeq ($(strip $(F120_PREFIX)),)
-$(error F120_PREFIX is required)
-endif
+ifneq ($(MOTION_STAGED),)
 ifeq ($(wildcard $(MOTION_HEADER)),)
 $(error F120 public header is missing: $(MOTION_HEADER))
 endif
 ifeq ($(wildcard $(MOTION_LINK_INPUTS)),)
 $(error F120 static archive is missing: $(MOTION_LINK_INPUTS))
+endif
 endif
 endif
 
@@ -92,6 +101,17 @@ $(BUILD_DIR)/%.o: src/%.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CMD_CPPFLAGS) $(CFLAGS) -MMD -MP -c $< -o $@
 
 $(CMD_OBJECTS): $(MOTION_HEADER)
+
+ifeq ($(MOTION_STAGED),)
+# Build output stays under our build directory so the submodule stays clean.
+$(MOTION_HEADER) $(MOTION_LINK_INPUTS) &:
+	@test -f $(MOTION)/include/kilix_motion_detect.h || { \
+		printf 'submodules missing; run: git submodule update --init --recursive\n' >&2; \
+		exit 1; }
+	$(MAKE) --no-print-directory -C $(MOTION) \
+		BUILD_DIR=$(abspath $(BUILD_DIR))/motion-build \
+		PREFIX=$(F120_PREFIX) install
+endif
 
 $(STATIC_LIB): $(LIB_OBJECTS)
 	$(AR) rcs $@ $^

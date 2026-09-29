@@ -9,8 +9,8 @@ alongside if you want to hear it too.
 
 ```sh
 git submodule update --init --recursive
-make F120_PREFIX=/absolute/path/to/kilix-motion-detect-prefix
-make F120_PREFIX=/absolute/path/to/kilix-motion-detect-prefix test
+make
+make test
 
 kilix-look image photo.jpg
 kilix-look watch rtsp://camera/stream --listen
@@ -139,7 +139,10 @@ export KILIX_OBJECT_DETECTOR="$HOME/.local/gpu_terminal/runtimes/yolo/venv/bin/p
 C11 and POSIX for the library. The command adds the F120-staged public header
 and static archive from
 [`kilix-motion-detect`](https://github.com/itsmygithubacct/kilix-motion-detect)
-for the motion gate, plus the vendored and pinned
+for the motion gate. Pass `F120_PREFIX=/absolute/prefix` to use an already
+staged provider; without it, `make` stages the pinned submodule under
+`build/f120-motion` first, so a clean checkout builds on its own. The command
+also needs the vendored and pinned
 [`kilix-rtsp`](https://github.com/itsmygithubacct/kilix-rtsp) for decoding,
 and `kilix-sound-detect` for `--listen`. The terminal stack comes through
 kilix-rtsp's own closure. At runtime: the `ffmpeg` binary and a detector
