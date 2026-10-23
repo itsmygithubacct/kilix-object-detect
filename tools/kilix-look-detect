@@ -45,7 +45,9 @@ def main():
     parser.add_argument("--geometry", default="640x360")
     parser.add_argument("--model", default="yolo26s")
     parser.add_argument("--device", default=None)
-    parser.add_argument("--conf", type=float, default=0.25)
+    # Keep the backend floor below the library's default threshold.
+    # Callers requesting scores below 0.1 must also lower --conf here.
+    parser.add_argument("--conf", type=float, default=0.1)
     options = parser.parse_args()
 
     width, _, height = options.geometry.partition("x")
