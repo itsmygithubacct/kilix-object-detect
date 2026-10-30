@@ -86,6 +86,13 @@ footage the models invented toilets and aeroplanes. Filtering by name is what
 makes a 0.25 confidence safe, and 0.45 demonstrably dropped real people in
 infrared.
 
+**The pipe and the scaler are public.** A sibling with a different model - a
+face detector that means "face" by class 0, an embedder that answers 512
+floats - needs the same supervised subprocess and the same square cut from
+the frame. `kod_pipe_*` and `kod_scale_into_square()` are those, exported so
+nobody copies them, and `any_class` lets such a detector's rows through the
+allowlist.
+
 **Every coordinate transform is in one function.** A crop is scaled into the
 model's square, the model answers in normalised square space, and getting back
 to frame pixels means undoing the letterbox, the scale and the crop's origin.

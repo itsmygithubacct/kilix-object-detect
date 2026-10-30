@@ -85,6 +85,7 @@ STATIC_LIB := $(BUILD_DIR)/lib$(PROJECT).a
 COMMAND := $(BUILD_DIR)/$(COMMAND_NAME)
 
 TESTS := $(BUILD_DIR)/test-regions $(BUILD_DIR)/test-detect \
+	$(BUILD_DIR)/test-pipe \
 	$(BUILD_DIR)/test-scaler
 
 TOOLS := tools/kilix-look-detect
@@ -129,9 +130,13 @@ $(COMMAND): $(CMD_OBJECTS) $(STATIC_LIB) $(CMD_VENDOR_OBJECTS) \
 	$(CC) $(CPPFLAGS) $(CMD_CPPFLAGS) $(CFLAGS) $(LDFLAGS) $^ \
 		$(CMD_LDLIBS) -o $@
 
+# $< and the archive by name, not $^: the recorded dependencies add the
+# headers - and, for the scaler test, the source it includes - to the
+# prerequisites, and a second `make test` would compile that source twice
+# and fail to link on the duplicate definitions.
 $(BUILD_DIR)/test-%: tests/test_%.c $(STATIC_LIB) | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) -DKOD_TEST_BUILD_DIR='"$(BUILD_DIR)"' \
-		$(CFLAGS) $(LDFLAGS) -MMD -MP $^ -lm -o $@
+		$(CFLAGS) $(LDFLAGS) -MMD -MP $< $(STATIC_LIB) -lm -o $@
 
 test: $(TESTS) $(COMMAND)
 	@set -e; for binary in $(TESTS); do \

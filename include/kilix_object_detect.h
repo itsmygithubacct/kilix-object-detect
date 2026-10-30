@@ -41,7 +41,7 @@ extern "C" {
 #endif
 
 #define KILIX_OBJECT_DETECT_VERSION_MAJOR 0
-#define KILIX_OBJECT_DETECT_VERSION_MINOR 1
+#define KILIX_OBJECT_DETECT_VERSION_MINOR 2
 #define KILIX_OBJECT_DETECT_VERSION_PATCH 0
 
 /*
@@ -119,6 +119,99 @@ size_t kod_regions(
     const kod_rect *motion, size_t count, int frame_width, int frame_height,
     int min_size, kod_rect *out, size_t capacity, size_t *dropped);
 
+/* -------------------------------- the pipe ------------------------------- */
+
+/*
+ * The supervised subprocess on its own, for a sibling whose reply is not
+ * the detector's.
+ *
+ * A face embedder answers float32[512]; a face detector answers the same
+ * 480 bytes this detector does but means "face" by class 0.  What they
+ * share is everything that is hard about a model in another process:
+ * starting it and knowing why it did not start, a first reply that takes
+ * a minute and later replies that take milliseconds, a deadline on the
+ * whole read rather than on each piece of it, and closing a child that
+ * will not stop.  That code was written once, here.  This is the door a
+ * sibling uses instead of copying it.
+ *
+ * Fixed-size both ways.  The caller decides what a request and a reply
+ * are; the pipe moves the bytes and keeps the time.
+ */
+#define KOD_ARGV_MAX 13
+#define KOD_EXTRA_MAX 4
+
+typedef struct kod_pipe kod_pipe;
+
+typedef struct kod_pipe_options {
+    /* The command, argv-style and NULL-terminated.  Required. */
+    const char *const *argv;
+    /* Appended after argv - "--geometry", "320x320" - or NULL.  At most
+     * KOD_EXTRA_MAX words. */
+    const char *const *extra;
+    /* Seconds for a reply once the first has ever arrived.  Default 5,
+     * at most a day. */
+    int timeout_seconds;
+    /* Seconds for the first reply.  Default 90; never less than
+     * timeout_seconds, at most a day.  See kod_options for why it is
+     * that long. */
+    int warmup_seconds;
+    /* Where the child's stderr goes, or NULL to leave it alone. */
+    const char *log_path;
+} kod_pipe_options;
+
+void kod_pipe_options_init(kod_pipe_options *options);
+
+/*
+ * Which command to run: the words of `env_variable` if it is set and
+ * usable, else the tool named `bundled`, found the way kod_bundled_tool()
+ * finds it.  `storage` holds the strings `argv` points into and must
+ * outlive them.  A variable that is set but unusable - too many words,
+ * or too long - is refused whole rather than run truncated, and the
+ * bundled tool is used instead.
+ */
+bool kod_pipe_resolve(
+    const char *env_variable, const char *bundled, char *storage,
+    size_t storage_size, const char **argv, size_t capacity);
+
+/* False when the child never started; its stderr says why. */
+bool kod_pipe_open(kod_pipe **pipe, const kod_pipe_options *options);
+void kod_pipe_close(kod_pipe *pipe);
+
+/* The last failure as a short phrase, or NULL.  Once set, the pipe is
+ * broken and every call fails until it is closed. */
+const char *kod_pipe_error(const kod_pipe *pipe);
+
+/* One request, whole, bounded by the warm-up or steady-state allowance.
+ * A successful send starts the reply clock. */
+bool kod_pipe_send(kod_pipe *pipe, const uint8_t *bytes, size_t size);
+
+/*
+ * One reply, whole, waiting until the deadline the last send started:
+ * the warm-up allowance before any reply has ever arrived, the timeout
+ * after.  Bytes already in the pipe when the deadline passes still
+ * count; a reply that trickles in does not restart the clock.  The
+ * clock also starts at open, so a child that speaks first can be
+ * received.  A child that closes its end fails at once, and
+ * kod_pipe_exited() says so: a crash is a different fact from a slow
+ * model, and the two send an operator to different places.
+ */
+bool kod_pipe_receive(kod_pipe *pipe, uint8_t *bytes, size_t size);
+bool kod_pipe_exited(const kod_pipe *pipe);
+
+/* Both, for a caller that can wait. */
+bool kod_pipe_call(
+    kod_pipe *pipe, const uint8_t *request, size_t request_size,
+    uint8_t *reply, size_t reply_size);
+
+/* For a caller that cannot wait: whether the reply has begun to arrive,
+ * and whether the deadline has passed without it.  Neither blocks. */
+bool kod_pipe_pending(const kod_pipe *pipe);
+bool kod_pipe_overdue(const kod_pipe *pipe);
+
+/* Whether any reply has ever arrived: what "did not answer" means
+ * depends on it. */
+bool kod_pipe_warm(const kod_pipe *pipe);
+
 /* ------------------------------- detector ------------------------------- */
 
 typedef struct kod_detector kod_detector;
@@ -166,6 +259,17 @@ typedef struct kod_options {
      * a caller drawing a full-screen view wants it in a file, because one
      * stray line into the alternate screen corrupts the display. */
     const char *log_path;
+
+    /*
+     * Report every class the detector names, not only the allowlist.
+     *
+     * For a detector whose classes are not COCO's - a face detector
+     * answering class 0 and meaning "face" - the allowlist would pass
+     * that row as a person or drop it.  kod_label() still knows only
+     * COCO, so a caller setting this labels the classes itself.  Default
+     * false.
+     */
+    bool any_class;
 } kod_options;
 
 void kod_options_init(kod_options *options);
@@ -228,6 +332,34 @@ bool kod_take(
 /* How many crops have been run since opening: the number that says what
  * the motion gate is actually saving. */
 uint64_t kod_crops(const kod_detector *detector);
+
+/* ------------------------------- the pixels ------------------------------ */
+
+/* Where a source rectangle landed inside a square: source pixels per
+ * square pixel, and where the image starts inside it.  Undoing a box is
+ * minus the offsets, times the scale, plus the rectangle's own origin,
+ * in that order and in one place. */
+typedef struct kod_fit {
+    float scale;
+    int offset_x;
+    int offset_y;
+} kod_fit;
+
+/*
+ * A source rectangle into a BGRA square, by area averaging, letterboxed.
+ *
+ * Public because every model in this family is fed a square cut from a
+ * frame and two ways of cutting one drift: the face embedder must be
+ * given the same pixels the face detector was.  `square` holds
+ * size*size*4 bytes and is fully written.  Area averaging rather than
+ * point sampling, and that is not a detail: the motion module measured
+ * point sampling reporting movement on every frame of a still scene
+ * where averaging reported a quarter.  A degenerate rectangle or an
+ * absurd size yields a black square at scale 1.
+ */
+kod_fit kod_scale_into_square(
+    const uint8_t *bgra, int width, int height, const kod_rect *from,
+    uint8_t *square, int size);
 
 /* ------------------------------- drawing --------------------------------- */
 

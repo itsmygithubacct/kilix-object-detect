@@ -15,6 +15,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <math.h>
 #include <poll.h>
 #include <signal.h>
 #include <stdio.h>
@@ -25,25 +26,29 @@
 #include <unistd.h>
 
 #define ERROR_MAX 160
-#define KOD_ARGV_MAX 13
 #define KOD_DETECTOR_ENV "KILIX_OBJECT_DETECTOR"
 #define KOD_DETECTOR_NAME "kilix-look-detect"
 
-typedef struct fit {
-    float scale;      /* source pixels per square pixel */
-    int offset_x;     /* where the image starts inside the square */
-    int offset_y;
-} fit;
+/* The public name, kept short inside. */
+typedef kod_fit fit;
 
-struct kod_detector {
+struct kod_pipe {
     pid_t child;
     int to_child;
     int from_child;
-    int size;
-    float min_score;
     int timeout_ms;
     int warmup_ms;
     bool warm;
+    bool broken;
+    int64_t sent_at_ms;   /* when the outstanding request went out */
+    char error[ERROR_MAX];
+};
+
+struct kod_detector {
+    kod_pipe *pipe;
+    int size;
+    float min_score;
+    bool any_class;
     bool broken;
     uint64_t crops;
     char error[ERROR_MAX];
@@ -66,7 +71,6 @@ struct kod_detector {
     size_t sent;          /* ...written to the child */
     kod_box collected[KOD_BOX_MAX];
     size_t collected_count;
-    int64_t sent_at_ms;   /* when the outstanding crop went out */
     bool busy;
 };
 
@@ -244,6 +248,11 @@ size_t kod_regions(
         }
         if (!absorbed && merged_count < sizeof(merged) / sizeof(merged[0])) {
             merged[merged_count++] = candidate;
+        } else if (!absorbed) {
+            /* No room in the merge table either: counted, never silent. */
+            if (dropped != NULL) {
+                (*dropped)++;
+            }
         }
     }
     /* Merging can bring two groups into contact, so settle it. */
@@ -337,6 +346,50 @@ void kod_bundled_tool(const char *name, char *out, size_t size)
     }
 }
 
+/* -------------------------------- the pipe ------------------------------- */
+
+static bool write_all(int fd, const uint8_t *bytes, size_t size, int timeout_ms);
+static int64_t now_ms(void);
+typedef enum read_outcome {
+    READ_WHOLE = 0,
+    READ_TIMED_OUT,
+    READ_ENDED      /* end of file or an error: the writer is gone */
+} read_outcome;
+
+static read_outcome read_all(int fd, uint8_t *bytes, size_t size,
+                             int timeout_ms);
+static void reap(pid_t child);
+
+static int seconds_to_ms(int seconds, int fallback)
+{
+    if (seconds <= 0) {
+        seconds = fallback;
+    }
+    if (seconds > 86400) {
+        seconds = 86400;
+    }
+    return seconds * 1000;
+}
+
+static bool pipe_fail(kod_pipe *pipe, const char *reason)
+{
+    if (pipe != NULL) {
+        (void)snprintf(pipe->error, sizeof(pipe->error), "%s", reason);
+        pipe->broken = true;
+    }
+    return false;
+}
+
+void kod_pipe_options_init(kod_pipe_options *options)
+{
+    if (options == NULL) {
+        return;
+    }
+    (void)memset(options, 0, sizeof(*options));
+    options->timeout_seconds = 5;
+    options->warmup_seconds = 90;
+}
+
 static bool argv_from_env(const char *variable, char *storage,
                           size_t storage_size, const char **argv,
                           size_t capacity)
@@ -375,103 +428,104 @@ static bool argv_from_env(const char *variable, char *storage,
     return true;
 }
 
-static void reap(pid_t child);
-
-bool kod_open(kod_detector **out, const kod_options *options)
+bool kod_pipe_resolve(
+    const char *env_variable, const char *bundled, char *storage,
+    size_t storage_size, const char **argv, size_t capacity)
 {
-    kod_options defaults;
-    const char *env_argv[KOD_ARGV_MAX + 1];
-    const char *fallback[2];
-    char env_storage[512];
-    char bundled[1024];
-    const char *const *chosen;
-    kod_detector *detector;
+    if (storage == NULL || argv == NULL || capacity < 2u ||
+        storage_size == 0u) {
+        return false;
+    }
+    if (env_variable != NULL &&
+        argv_from_env(env_variable, storage, storage_size, argv, capacity)) {
+        return true;
+    }
+    if (bundled == NULL) {
+        return false;
+    }
+    kod_bundled_tool(bundled, storage, storage_size);
+    argv[0] = storage;
+    argv[1] = NULL;
+    return true;
+}
+
+bool kod_pipe_open(kod_pipe **out, const kod_pipe_options *options)
+{
+    kod_pipe *pipe_;
     int to_child[2];
     int from_child[2];
     int status[2];
-    char geometry[32];
+    size_t words = 0u;
+    size_t extras = 0u;
 
     if (out == NULL) {
         return false;
     }
     *out = NULL;
-    if (options == NULL) {
-        kod_options_init(&defaults);
-        options = &defaults;
-    }
-    if (options->size <= 0 || options->size > 4096) {
+    if (options == NULL || options->argv == NULL) {
         return false;
     }
-    detector = calloc(1u, sizeof(*detector));
-    if (detector == NULL) {
+    while (options->argv[words] != NULL) {
+        words++;
+    }
+    if (words == 0u || words > KOD_ARGV_MAX) {
         return false;
     }
-    detector->size = options->size;
-    detector->min_score = options->min_score;
-    detector->timeout_ms =
-        (options->timeout_seconds > 0 ? options->timeout_seconds : 5) * 1000;
-    detector->warmup_ms =
-        (options->warmup_seconds > 0 ? options->warmup_seconds : 90) * 1000;
-    if (detector->warmup_ms < detector->timeout_ms) {
-        detector->warmup_ms = detector->timeout_ms;
-    }
-    detector->to_child = -1;
-    detector->from_child = -1;
-
-    kod_bundled_tool(KOD_DETECTOR_NAME, bundled, sizeof(bundled));
-    fallback[0] = bundled;
-    fallback[1] = NULL;
-    chosen = options->argv;
-    if (chosen == NULL &&
-        argv_from_env(KOD_DETECTOR_ENV, env_storage, sizeof(env_storage),
-                      env_argv, KOD_ARGV_MAX + 1u)) {
-        chosen = env_argv;
-    }
-    if (chosen == NULL) {
-        chosen = fallback;
-    }
-    {
-        size_t words = 0u;
-
-        while (chosen[words] != NULL) {
-            words++;
+    if (options->extra != NULL) {
+        while (options->extra[extras] != NULL) {
+            extras++;
         }
-        if (words == 0u || words > KOD_ARGV_MAX) {
-            free(detector);
+        if (extras > KOD_EXTRA_MAX) {
             return false;
         }
     }
+    pipe_ = calloc(1u, sizeof(*pipe_));
+    if (pipe_ == NULL) {
+        return false;
+    }
+    /* A day is the most either allowance can be: beyond that the
+     * millisecond arithmetic would overflow and a "bounded" wait would
+     * not be. */
+    pipe_->timeout_ms = seconds_to_ms(options->timeout_seconds, 5);
+    pipe_->warmup_ms = seconds_to_ms(options->warmup_seconds, 90);
+    if (pipe_->warmup_ms < pipe_->timeout_ms) {
+        pipe_->warmup_ms = pipe_->timeout_ms;
+    }
+    pipe_->to_child = -1;
+    pipe_->from_child = -1;
+    /* The clock starts now, so a child that speaks first - before any
+     * request - can be received with the warm-up allowance. */
+    pipe_->sent_at_ms = now_ms();
+
     if (pipe(to_child) != 0) {
-        free(detector);
+        free(pipe_);
         return false;
     }
     if (pipe(from_child) != 0) {
         (void)close(to_child[0]); (void)close(to_child[1]);
-        free(detector);
+        free(pipe_);
         return false;
     }
-    (void)snprintf(geometry, sizeof(geometry), "%dx%d", detector->size,
-                   detector->size);
     /* Close-on-exec, so a successful exec closes it and the parent reads
      * end-of-file.  Anything that arrives instead is the errno that
      * stopped it. */
     if (pipe(status) != 0) {
         (void)close(to_child[0]); (void)close(to_child[1]);
         (void)close(from_child[0]); (void)close(from_child[1]);
-        free(detector);
+        free(pipe_);
         return false;
     }
     (void)fcntl(status[1], F_SETFD, FD_CLOEXEC);
-    detector->child = fork();
-    if (detector->child < 0) {
+    pipe_->child = fork();
+    if (pipe_->child < 0) {
         (void)close(to_child[0]); (void)close(to_child[1]);
         (void)close(from_child[0]); (void)close(from_child[1]);
         (void)close(status[0]); (void)close(status[1]);
-        free(detector);
+        free(pipe_);
         return false;
     }
-    if (detector->child == 0) {
-        char *child_argv[KOD_ARGV_MAX + 3];
+    if (pipe_->child == 0) {
+        char *child_argv[KOD_ARGV_MAX + KOD_EXTRA_MAX + 1];
         size_t count = 0u;
 
         (void)dup2(to_child[0], STDIN_FILENO);
@@ -487,21 +541,21 @@ bool kod_open(kod_detector **out, const kod_options *options)
                 (void)close(log);
             }
         }
-        while (chosen[count] != NULL && count < KOD_ARGV_MAX) {
-            child_argv[count] = (char *)chosen[count];
-            count++;
+        for (size_t i = 0u; i < words; i++) {
+            child_argv[count++] = (char *)options->argv[i];
         }
-        child_argv[count++] = (char *)"--geometry";
-        child_argv[count++] = geometry;
+        for (size_t i = 0u; i < extras; i++) {
+            child_argv[count++] = (char *)options->extra[i];
+        }
         child_argv[count] = NULL;
         (void)execvp(child_argv[0], child_argv);
         /*
          * Exec failed, and this is the only moment anything knows why.
          *
-         * The log first, then the signal down the status pipe: kod_open()
-         * returns as soon as it reads that, and a caller looking at the
-         * log would otherwise find it empty.  Losing this is how a
-         * detector nobody installed becomes "the detector stopped
+         * The log first, then the signal down the status pipe:
+         * kod_pipe_open() returns as soon as it reads that, and a caller
+         * looking at the log would otherwise find it empty.  Losing this
+         * is how a tool nobody installed becomes "the child stopped
          * reading" seconds later, against a blank log.
          */
         {
@@ -523,20 +577,29 @@ bool kod_open(kod_detector **out, const kod_options *options)
 
         (void)close(status[0]);
         if (got == (ssize_t)sizeof(reason)) {
-            /* It never started.  Refusing here beats a detector that
-             * looks open and reports a broken pipe on the first crop -
+            /* It never started.  Refusing here beats a pipe that looks
+             * open and reports a broken write on the first request -
              * which is indistinguishable from a model that crashed. */
             (void)close(to_child[1]);
             (void)close(from_child[0]);
-            reap(detector->child);
-            free(detector);
+            reap(pipe_->child);
+            free(pipe_);
             return false;
         }
     }
-    detector->to_child = to_child[1];
-    detector->from_child = from_child[0];
+    pipe_->to_child = to_child[1];
+    pipe_->from_child = from_child[0];
+    /* Later model children must not keep this child's pipes alive across
+     * exec. Nonblocking writes make the request deadline enforceable even
+     * when a child never reads stdin. */
+    if (fcntl(pipe_->to_child, F_SETFD, FD_CLOEXEC) < 0 ||
+        fcntl(pipe_->from_child, F_SETFD, FD_CLOEXEC) < 0 ||
+        fcntl(pipe_->to_child, F_SETFL, O_NONBLOCK) < 0) {
+        kod_pipe_close(pipe_);
+        return false;
+    }
     (void)signal(SIGPIPE, SIG_IGN);
-    *out = detector;
+    *out = pipe_;
     return true;
 }
 
@@ -568,6 +631,172 @@ static void reap(pid_t child)
     (void)waitpid(child, &status, 0);
 }
 
+void kod_pipe_close(kod_pipe *pipe_)
+{
+    if (pipe_ == NULL) {
+        return;
+    }
+    if (pipe_->to_child >= 0) { (void)close(pipe_->to_child); }
+    if (pipe_->from_child >= 0) { (void)close(pipe_->from_child); }
+    reap(pipe_->child);
+    free(pipe_);
+}
+
+const char *kod_pipe_error(const kod_pipe *pipe_)
+{
+    if (pipe_ == NULL || pipe_->error[0] == '\0') {
+        return NULL;
+    }
+    return pipe_->error;
+}
+
+bool kod_pipe_send(kod_pipe *pipe_, const uint8_t *bytes, size_t size)
+{
+    if (pipe_ == NULL || pipe_->broken || bytes == NULL || size == 0u) {
+        return false;
+    }
+    if (!write_all(pipe_->to_child, bytes, size,
+                   pipe_->warm ? pipe_->timeout_ms : pipe_->warmup_ms)) {
+        return pipe_fail(pipe_, "the child stopped reading or exceeded the request deadline");
+    }
+    pipe_->sent_at_ms = now_ms();
+    return true;
+}
+
+/* Warm-up until the first reply has ever arrived, the timeout after. */
+static int pipe_limit_ms(const kod_pipe *pipe_)
+{
+    return pipe_->warm ? pipe_->timeout_ms : pipe_->warmup_ms;
+}
+
+bool kod_pipe_receive(kod_pipe *pipe_, uint8_t *bytes, size_t size)
+{
+    int64_t remaining;
+
+    if (pipe_ == NULL || pipe_->broken || bytes == NULL || size == 0u) {
+        return false;
+    }
+    /* What is left of the deadline is what it gets: time spent between
+     * the send and this call already came out of the same budget. */
+    remaining = (int64_t)pipe_limit_ms(pipe_) - (now_ms() - pipe_->sent_at_ms);
+    if (remaining < 0) {
+        remaining = 0;
+    }
+    switch (read_all(pipe_->from_child, bytes, size, (int)remaining)) {
+    case READ_WHOLE:
+        pipe_->warm = true;
+        return true;
+    case READ_ENDED:
+        return pipe_fail(pipe_, "the child exited");
+    case READ_TIMED_OUT:
+    default:
+        return pipe_fail(pipe_, pipe_->warm
+                                    ? "the child did not answer in time"
+                                    : "the child never answered (no model?)");
+    }
+}
+
+/* Whether the child is gone, as opposed to slow: what the caller should
+ * say depends on it. */
+bool kod_pipe_exited(const kod_pipe *pipe_)
+{
+    return pipe_ != NULL && pipe_->broken &&
+           strcmp(pipe_->error, "the child exited") == 0;
+}
+
+bool kod_pipe_call(
+    kod_pipe *pipe_, const uint8_t *request, size_t request_size,
+    uint8_t *reply, size_t reply_size)
+{
+    return kod_pipe_send(pipe_, request, request_size) &&
+           kod_pipe_receive(pipe_, reply, reply_size);
+}
+
+bool kod_pipe_pending(const kod_pipe *pipe_)
+{
+    struct pollfd descriptor;
+
+    if (pipe_ == NULL || pipe_->broken) {
+        return false;
+    }
+    descriptor.fd = pipe_->from_child;
+    descriptor.events = POLLIN;
+    descriptor.revents = 0;
+    return poll(&descriptor, 1u, 0) > 0;
+}
+
+bool kod_pipe_overdue(const kod_pipe *pipe_)
+{
+    if (pipe_ == NULL || pipe_->broken) {
+        return false;
+    }
+    return now_ms() - pipe_->sent_at_ms > (int64_t)pipe_limit_ms(pipe_);
+}
+
+bool kod_pipe_warm(const kod_pipe *pipe_)
+{
+    return pipe_ != NULL && pipe_->warm;
+}
+
+/* ------------------------------ the detector ----------------------------- */
+
+bool kod_open(kod_detector **out, const kod_options *options)
+{
+    kod_options defaults;
+    kod_pipe_options pipe_options;
+    const char *resolved[KOD_ARGV_MAX + 1];
+    char storage[1024];
+    const char *extra[3];
+    char geometry[32];
+    kod_detector *detector;
+
+    if (out == NULL) {
+        return false;
+    }
+    *out = NULL;
+    if (options == NULL) {
+        kod_options_init(&defaults);
+        options = &defaults;
+    }
+    if (options->size <= 0 || options->size > 4096) {
+        return false;
+    }
+    detector = calloc(1u, sizeof(*detector));
+    if (detector == NULL) {
+        return false;
+    }
+    detector->size = options->size;
+    detector->min_score = options->min_score;
+    detector->any_class = options->any_class;
+
+    kod_pipe_options_init(&pipe_options);
+    pipe_options.argv = options->argv;
+    if (pipe_options.argv == NULL) {
+        if (!kod_pipe_resolve(KOD_DETECTOR_ENV, KOD_DETECTOR_NAME, storage,
+                              sizeof(storage), resolved,
+                              KOD_ARGV_MAX + 1u)) {
+            free(detector);
+            return false;
+        }
+        pipe_options.argv = resolved;
+    }
+    (void)snprintf(geometry, sizeof(geometry), "%dx%d", detector->size,
+                   detector->size);
+    extra[0] = "--geometry";
+    extra[1] = geometry;
+    extra[2] = NULL;
+    pipe_options.extra = extra;
+    pipe_options.timeout_seconds = options->timeout_seconds;
+    pipe_options.warmup_seconds = options->warmup_seconds;
+    pipe_options.log_path = options->log_path;
+    if (!kod_pipe_open(&detector->pipe, &pipe_options)) {
+        free(detector);
+        return false;
+    }
+    *out = detector;
+    return true;
+}
+
 static void free_queued(kod_detector *detector)
 {
     for (size_t i = 0u; i < KOD_REGION_MAX; i++) {
@@ -581,9 +810,7 @@ void kod_close(kod_detector *detector)
     if (detector == NULL) {
         return;
     }
-    if (detector->to_child >= 0) { (void)close(detector->to_child); }
-    if (detector->from_child >= 0) { (void)close(detector->from_child); }
-    reap(detector->child);
+    kod_pipe_close(detector->pipe);
     free_queued(detector);
     free(detector);
 }
@@ -771,18 +998,51 @@ static fit scale_into_square(
     return placement;
 }
 
-static bool write_all(int fd, const uint8_t *bytes, size_t size)
+kod_fit kod_scale_into_square(
+    const uint8_t *bgra, int width, int height, const kod_rect *from,
+    uint8_t *square, int size)
+{
+    const kod_fit none = {1.0f, 0, 0};
+
+    if (square == NULL || size <= 0 || size > 4096) {
+        return none;
+    }
+    if (bgra == NULL || from == NULL || width <= 0 || height <= 0 ||
+        from->w <= 0 || from->h <= 0) {
+        (void)memset(square, 0, (size_t)size * (size_t)size * 4u);
+        return none;
+    }
+    return scale_into_square(bgra, width, height, from, square, size);
+}
+
+static bool write_all(int fd, const uint8_t *bytes, size_t size, int timeout_ms)
 {
     size_t offset = 0u;
+    const int64_t deadline = now_ms() + timeout_ms;
 
     while (offset < size) {
-        const ssize_t put = write(fd, bytes + offset, size - offset);
+        struct pollfd descriptor = {fd, POLLOUT, 0};
+        const int64_t remaining = deadline - now_ms();
+        ssize_t put;
+        int ready;
+
+        if (remaining <= 0) {
+            return false;
+        }
+        ready = poll(&descriptor, 1u, (int)remaining);
+        if (ready < 0 && errno == EINTR) {
+            continue;
+        }
+        if (ready <= 0 || (descriptor.revents & POLLOUT) == 0) {
+            return false;
+        }
+        put = write(fd, bytes + offset, size - offset);
 
         if (put > 0) {
             offset += (size_t)put;
             continue;
         }
-        if (put < 0 && errno == EINTR) {
+        if (put < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) {
             continue;
         }
         return false;
@@ -810,7 +1070,8 @@ static int64_t now_ms(void)
  * Whatever has already arrived when the deadline passes still counts, so
  * a reply that is sitting in the pipe complete is never refused.
  */
-static bool read_all(int fd, uint8_t *bytes, size_t size, int timeout_ms)
+static read_outcome read_all(int fd, uint8_t *bytes, size_t size,
+                             int timeout_ms)
 {
     const int64_t deadline = now_ms() + timeout_ms;
     size_t offset = 0u;
@@ -825,8 +1086,11 @@ static bool read_all(int fd, uint8_t *bytes, size_t size, int timeout_ms)
             remaining = 0;
         }
         ready = poll(&descriptor, 1u, (int)remaining);
+        if (ready < 0 && errno == EINTR) {
+            continue;
+        }
         if (ready <= 0) {
-            return false;
+            return READ_TIMED_OUT;
         }
         got = read(fd, bytes + offset, size - offset);
         if (got > 0) {
@@ -836,9 +1100,13 @@ static bool read_all(int fd, uint8_t *bytes, size_t size, int timeout_ms)
         if (got < 0 && errno == EINTR) {
             continue;
         }
-        return false;
+        /* Nothing more will ever come: the child closed its end, which
+         * is a crash or an exit, and is a different fact from a model
+         * that is merely slow.  Saying so sends the operator to the log
+         * instead of to the timeout knob. */
+        return READ_ENDED;
     }
-    return true;
+    return READ_WHOLE;
 }
 
 /*
@@ -887,13 +1155,23 @@ static bool send_next(kod_detector *detector)
     if (detector->sent >= detector->batch) {
         return true;
     }
-    if (!write_all(detector->to_child, detector->queued[detector->sent],
-                   bytes)) {
+    if (!kod_pipe_send(detector->pipe, detector->queued[detector->sent],
+                       bytes)) {
         return fail(detector, "the detector stopped reading");
     }
     detector->sent++;
-    detector->sent_at_ms = now_ms();
     return true;
+}
+
+/* Three different facts, three different sentences: a crash, a slow
+ * model, and a model that never loaded look alike from a timeout alone. */
+static const char *reply_failure(const kod_pipe *pipe_)
+{
+    if (kod_pipe_exited(pipe_)) {
+        return "the detector exited (crashed? see the log)";
+    }
+    return kod_pipe_warm(pipe_) ? "the detector did not answer in time"
+                                : "the detector never started (no model?)";
 }
 
 /*
@@ -902,7 +1180,7 @@ static bool send_next(kod_detector *detector)
  * normalised square -> square pixels -> minus the letterbox -> times the
  * scale -> plus the region's own origin.  Four steps, one place.
  */
-static bool take_reply(kod_detector *detector, int timeout_ms)
+static bool take_reply(kod_detector *detector)
 {
     uint8_t reply[KOD_REPLY_BYTES];
     float rows[KOD_REPLY_ROWS][KOD_REPLY_COLUMNS];
@@ -912,12 +1190,9 @@ static bool take_reply(kod_detector *detector, int timeout_ms)
     const int width = detector->frame_width;
     const int height = detector->frame_height;
 
-    if (!read_all(detector->from_child, reply, sizeof(reply), timeout_ms)) {
-        return fail(detector, detector->warm
-                                  ? "the detector did not answer in time"
-                                  : "the detector never started (no model?)");
+    if (!kod_pipe_receive(detector->pipe, reply, sizeof(reply))) {
+        return fail(detector, reply_failure(detector->pipe));
     }
-    detector->warm = true;
     detector->crops++;
     (void)memcpy(rows, reply, sizeof(rows));
     for (size_t i = 0u;
@@ -930,10 +1205,17 @@ static bool take_reply(kod_detector *detector, int timeout_ms)
         float x1 = rows[i][5];
         kod_box *box;
 
-        if (score < detector->min_score) {
+        /* Not-a-number passes every comparison written the usual way and
+         * turns into an arbitrary int; a broken or hostile tool must not
+         * be able to place a box that way.  Six finite floats or nothing. */
+        if (!isfinite(rows[i][0]) || !isfinite(score) || !isfinite(y0) ||
+            !isfinite(x0) || !isfinite(y1) || !isfinite(x1)) {
             continue;
         }
-        if (kod_label(class_id) == NULL) {
+        if (!(score >= detector->min_score)) {
+            continue;
+        }
+        if (!detector->any_class && kod_label(class_id) == NULL) {
             continue;
         }
         /* Normalised, in the square this crop was drawn into. */
@@ -1043,9 +1325,13 @@ bool kod_detect(
     if (count != NULL) {
         *count = 0u;
     }
-    if (detector == NULL || detector->broken || bgra == NULL || out == NULL ||
-        width <= 0 || height <= 0) {
+    if (detector == NULL || detector->broken) {
         return false;
+    }
+    if (bgra == NULL || out == NULL || width <= 0 || height <= 0) {
+        /* A refusal with a reason, not a silent false: a caller cannot
+         * otherwise tell its own mistake from a detector that died. */
+        return refuse(detector, "not a frame");
     }
     if (detector->busy) {
         return refuse(detector, "a batch is already in flight");
@@ -1055,9 +1341,7 @@ bool kod_detect(
     whole.w = width;
     whole.h = height;
     if (!scale_all(detector, bgra, width, height, &whole, 1u) ||
-        !send_next(detector) ||
-        !take_reply(detector, detector->warm ? detector->timeout_ms
-                                             : detector->warmup_ms)) {
+        !send_next(detector) || !take_reply(detector)) {
         detector->batch = 0u;
         detector->sent = 0u;
         return false;
@@ -1082,9 +1366,13 @@ bool kod_detect_regions(
     if (count != NULL) {
         *count = 0u;
     }
-    if (detector == NULL || detector->broken || bgra == NULL || out == NULL ||
-        width <= 0 || height <= 0) {
+    if (detector == NULL || detector->broken) {
         return false;
+    }
+    if (bgra == NULL || out == NULL || width <= 0 || height <= 0) {
+        /* A refusal with a reason, not a silent false: a caller cannot
+         * otherwise tell its own mistake from a detector that died. */
+        return refuse(detector, "not a frame");
     }
     if (detector->busy) {
         return refuse(detector, "a batch is already in flight");
@@ -1116,10 +1404,7 @@ bool kod_detect_regions(
             }
             detector->collected_count = kept;   /* earlier rounds stay */
             while (detector->sent < detector->batch) {
-                if (!send_next(detector) ||
-                    !take_reply(detector, detector->warm
-                                              ? detector->timeout_ms
-                                              : detector->warmup_ms)) {
+                if (!send_next(detector) || !take_reply(detector)) {
                     detector->batch = 0u;
                     detector->sent = 0u;
                     return false;
@@ -1148,9 +1433,12 @@ bool kod_offer(
     kod_detector *detector, const uint8_t *bgra, int width, int height,
     const kod_rect *regions, size_t region_count)
 {
-    if (detector == NULL || detector->broken || bgra == NULL || width <= 0 ||
-        height <= 0 || regions == NULL || region_count == 0u) {
+    if (detector == NULL || detector->broken) {
         return false;
+    }
+    if (bgra == NULL || width <= 0 || height <= 0 || regions == NULL ||
+        region_count == 0u) {
+        return refuse(detector, "not a frame, or no regions");
     }
     if (detector->busy) {
         /* Not a failure: a caller offering every frame is the expected
@@ -1178,19 +1466,17 @@ bool kod_take(
     kod_detector *detector, kod_box *out, size_t capacity, size_t *count,
     bool *done)
 {
-    struct pollfd descriptor;
-    const int limit = detector != NULL && detector->warm
-                          ? detector->timeout_ms
-                          : (detector != NULL ? detector->warmup_ms : 0);
-
     if (count != NULL) {
         *count = 0u;
     }
     if (done != NULL) {
         *done = false;
     }
-    if (detector == NULL || detector->broken || out == NULL) {
+    if (detector == NULL || detector->broken) {
         return false;
+    }
+    if (out == NULL) {
+        return refuse(detector, "nowhere to put the boxes");
     }
     if (!detector->busy) {
         if (done != NULL) {
@@ -1198,43 +1484,29 @@ bool kod_take(
         }
         return true;
     }
-    descriptor.fd = detector->from_child;
-    descriptor.events = POLLIN;
-    descriptor.revents = 0;
-    if (poll(&descriptor, 1u, 0) <= 0) {
+    if (!kod_pipe_pending(detector->pipe)) {
         /*
          * Nothing yet, which is the ordinary answer.  The deadline is
          * still enforced here, because a child that died holding a crop
          * would otherwise leave the detector busy forever and silently
          * stop detecting - the failure this whole path exists to avoid.
          */
-        if (now_ms() - detector->sent_at_ms > (int64_t)limit) {
+        if (kod_pipe_overdue(detector->pipe)) {
             detector->busy = false;
             detector->batch = 0u;
             detector->sent = 0u;
-            return fail(detector, detector->warm
-                                      ? "the detector did not answer in time"
-                                      : "the detector never started "
-                                        "(no model?)");
+            return fail(detector, reply_failure(detector->pipe));
         }
         return true;
     }
     /* Readable, so the reply is on its way and this cannot stall.  What
-     * is left of the deadline is what it gets: the time spent polling
-     * already came out of the same budget. */
-    {
-        int64_t remaining =
-            (int64_t)limit - (now_ms() - detector->sent_at_ms);
-
-        if (remaining < 0) {
-            remaining = 0;
-        }
-        if (!take_reply(detector, (int)remaining)) {
-            detector->busy = false;
-            detector->batch = 0u;
-            detector->sent = 0u;
-            return false;
-        }
+     * is left of the deadline is what it gets: the pipe counts from the
+     * send, so the time spent polling already came out of the budget. */
+    if (!take_reply(detector)) {
+        detector->busy = false;
+        detector->batch = 0u;
+        detector->sent = 0u;
+        return false;
     }
     if (detector->sent < detector->batch) {
         if (!send_next(detector)) {

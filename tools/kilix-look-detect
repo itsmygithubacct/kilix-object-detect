@@ -45,7 +45,10 @@ def main():
     parser.add_argument("--geometry", default="640x360")
     parser.add_argument("--model", default="yolo26s")
     parser.add_argument("--device", default=None)
-    parser.add_argument("--conf", type=float, default=0.25)
+    # Below the library's floor on purpose.  The library's min_score is the
+    # threshold that decides; a floor here equal to it made a lower
+    # --threshold on the caller's side silently do nothing.
+    parser.add_argument("--conf", type=float, default=0.1)
     options = parser.parse_args()
 
     width, _, height = options.geometry.partition("x")
