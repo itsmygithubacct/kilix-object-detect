@@ -15,6 +15,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <math.h>
 #include <poll.h>
 #include <signal.h>
@@ -820,6 +821,25 @@ uint64_t kod_crops(const kod_detector *detector)
     return detector == NULL ? 0u : detector->crops;
 }
 
+/* Truncate `delta` and add `origin`. False when the result is not an int:
+ * the cast is undefined outside that range, and a wrapped value is not a
+ * coordinate. The truncation matches `origin + (int)delta`. */
+static bool origin_plus_delta(int origin, float delta, int *out)
+{
+    const double value = (double)delta;
+    long long sum;
+
+    if (!isfinite(delta) || value < (double)INT_MIN || value >= 2147483648.0) {
+        return false;
+    }
+    sum = (long long)origin + (long long)(int)delta;
+    if (sum < (long long)INT_MIN || sum > (long long)INT_MAX) {
+        return false;
+    }
+    *out = (int)sum;
+    return true;
+}
+
 /* ------------------------------- the pixels ------------------------------ */
 
 /*
@@ -873,16 +893,30 @@ static fit scale_into_square(
          * pushes it past the frame - a real edge case on edge-hugging
          * crops - the careful route below handles it.
          */
-        const int last_x0 =
-            from->x + (int)((float)(drawn_w - 1) * placement.scale);
-        const int last_y0 =
-            from->y + (int)((float)(drawn_h - 1) * placement.scale);
-        int last_x1 = from->x + (int)((float)drawn_w * placement.scale);
-        int last_y1 = from->y + (int)((float)drawn_h * placement.scale);
+        int last_x0 = 0;
+        int last_y0 = 0;
+        int last_x1 = 0;
+        int last_y1 = 0;
+        const bool bounded =
+            origin_plus_delta(from->x,
+                              (float)(drawn_w - 1) * placement.scale,
+                              &last_x0) &&
+            origin_plus_delta(from->y,
+                              (float)(drawn_h - 1) * placement.scale,
+                              &last_y0) &&
+            origin_plus_delta(from->x, (float)drawn_w * placement.scale,
+                              &last_x1) &&
+            origin_plus_delta(from->y, (float)drawn_h * placement.scale,
+                              &last_y1);
 
-        if (last_x1 <= last_x0) { last_x1 = last_x0 + 1; }
-        if (last_y1 <= last_y0) { last_y1 = last_y0 + 1; }
-        if (last_x1 <= width && last_y1 <= height) {
+        if (bounded && last_x1 <= last_x0 && last_x0 < INT_MAX) {
+            last_x1 = last_x0 + 1;
+        }
+        if (bounded && last_y1 <= last_y0 && last_y0 < INT_MAX) {
+            last_y1 = last_y0 + 1;
+        }
+        if (bounded && last_x1 > last_x0 && last_y1 > last_y0 &&
+            last_x1 <= width && last_y1 <= height) {
             const size_t row_bytes = (size_t)size * 4u;
             const size_t left_bytes = (size_t)placement.offset_x * 4u;
             const size_t right_bytes =
@@ -953,18 +987,38 @@ static fit scale_into_square(
     (void)memset(square, 0, (size_t)size * (size_t)size * 4u);
     for (int y = 0; y < drawn_h; y++) {
         for (int x = 0; x < drawn_w; x++) {
-            const int from_x0 = from->x + (int)((float)x * placement.scale);
-            const int from_y0 = from->y + (int)((float)y * placement.scale);
-            int from_x1 = from->x + (int)((float)(x + 1) * placement.scale);
-            int from_y1 = from->y + (int)((float)(y + 1) * placement.scale);
+            int from_x0 = 0;
+            int from_y0 = 0;
+            int from_x1 = 0;
+            int from_y1 = 0;
             uint32_t blue = 0u;
             uint32_t green = 0u;
             uint32_t red = 0u;
             uint32_t taken = 0u;
             uint8_t *target;
 
-            if (from_x1 <= from_x0) { from_x1 = from_x0 + 1; }
-            if (from_y1 <= from_y0) { from_y1 = from_y0 + 1; }
+            if (!origin_plus_delta(from->x, (float)x * placement.scale,
+                                   &from_x0) ||
+                !origin_plus_delta(from->y, (float)y * placement.scale,
+                                   &from_y0) ||
+                !origin_plus_delta(from->x, (float)(x + 1) * placement.scale,
+                                   &from_x1) ||
+                !origin_plus_delta(from->y, (float)(y + 1) * placement.scale,
+                                   &from_y1)) {
+                continue;
+            }
+            if (from_x1 <= from_x0) {
+                if (from_x0 == INT_MAX) {
+                    continue;
+                }
+                from_x1 = from_x0 + 1;
+            }
+            if (from_y1 <= from_y0) {
+                if (from_y0 == INT_MAX) {
+                    continue;
+                }
+                from_y1 = from_y0 + 1;
+            }
             for (int sy_at = from_y0; sy_at < from_y1; sy_at++) {
                 if (sy_at < 0 || sy_at >= height) {
                     continue;
@@ -1097,7 +1151,8 @@ static read_outcome read_all(int fd, uint8_t *bytes, size_t size,
             offset += (size_t)got;
             continue;
         }
-        if (got < 0 && errno == EINTR) {
+        if (got < 0 && (errno == EINTR || errno == EAGAIN ||
+                        errno == EWOULDBLOCK)) {
             continue;
         }
         /* Nothing more will ever come: the child closed its end, which
@@ -1147,7 +1202,8 @@ static bool scale_all(
     return true;
 }
 
-/* The next queued crop to the child.  Fast: the child is always reading. */
+/* The next queued crop to the child. The write shares the pipe deadline,
+ * so a child that never reads fails here instead of blocking. */
 static bool send_next(kod_detector *detector)
 {
     const size_t bytes = (size_t)detector->size * (size_t)detector->size * 4u;
@@ -1157,7 +1213,8 @@ static bool send_next(kod_detector *detector)
     }
     if (!kod_pipe_send(detector->pipe, detector->queued[detector->sent],
                        bytes)) {
-        return fail(detector, "the detector stopped reading");
+        return fail(detector,
+                    "the detector stopped reading or exceeded the request deadline");
     }
     detector->sent++;
     return true;
@@ -1197,19 +1254,26 @@ static bool take_reply(kod_detector *detector)
     (void)memcpy(rows, reply, sizeof(rows));
     for (size_t i = 0u;
          i < KOD_REPLY_ROWS && detector->collected_count < KOD_BOX_MAX; i++) {
-        const int class_id = (int)rows[i][0];
         const float score = rows[i][1];
         float y0 = rows[i][2];
         float x0 = rows[i][3];
         float y1 = rows[i][4];
         float x1 = rows[i][5];
+        int class_id;
+        int at_x;
+        int at_y;
+        int at_w;
+        int at_h;
+        long long span;
         kod_box *box;
 
-        /* Not-a-number passes every comparison written the usual way and
-         * turns into an arbitrary int; a broken or hostile tool must not
-         * be able to place a box that way.  Six finite floats or nothing. */
+        /* Not-a-number passes every comparison written the usual way, and
+         * a float outside the int range cannot be cast.  Six finite,
+         * in-range values or nothing: a broken or hostile tool must not
+         * be able to place a box that way. */
         if (!isfinite(rows[i][0]) || !isfinite(score) || !isfinite(y0) ||
-            !isfinite(x0) || !isfinite(y1) || !isfinite(x1)) {
+            !isfinite(x0) || !isfinite(y1) || !isfinite(x1) ||
+            !origin_plus_delta(0, rows[i][0], &class_id)) {
             continue;
         }
         if (!(score >= detector->min_score)) {
@@ -1224,30 +1288,50 @@ static bool take_reply(kod_detector *detector)
         y0 = y0 * (float)detector->size - (float)placement.offset_y;
         y1 = y1 * (float)detector->size - (float)placement.offset_y;
 
-        box = &detector->collected[detector->collected_count];
-        box->class_id = class_id;
-        box->score = score;
-        box->region = (int)slot;
-        box->at.x = region->x + (int)(x0 * placement.scale);
-        box->at.y = region->y + (int)(y0 * placement.scale);
-        box->at.w = (int)((x1 - x0) * placement.scale);
-        box->at.h = (int)((y1 - y0) * placement.scale);
-        if (box->at.w <= 0 || box->at.h <= 0) {
+        if (!origin_plus_delta(region->x, x0 * placement.scale, &at_x) ||
+            !origin_plus_delta(region->y, y0 * placement.scale, &at_y) ||
+            !origin_plus_delta(0, (x1 - x0) * placement.scale, &at_w) ||
+            !origin_plus_delta(0, (y1 - y0) * placement.scale, &at_h)) {
+            continue;
+        }
+        if (at_w <= 0 || at_h <= 0) {
             continue;   /* a degenerate row is not a detection */
         }
         /* Clamped into the frame: a box mapped out of a letterboxed crop
          * can land a pixel or two outside it. */
-        if (box->at.x < 0) { box->at.w += box->at.x; box->at.x = 0; }
-        if (box->at.y < 0) { box->at.h += box->at.y; box->at.y = 0; }
-        if (box->at.x + box->at.w > width) {
-            box->at.w = width - box->at.x;
+        if (at_x < 0) {
+            span = (long long)at_w + (long long)at_x;
+            if (span <= 0) {
+                continue;
+            }
+            at_w = (int)span;
+            at_x = 0;
         }
-        if (box->at.y + box->at.h > height) {
-            box->at.h = height - box->at.y;
+        if (at_y < 0) {
+            span = (long long)at_h + (long long)at_y;
+            if (span <= 0) {
+                continue;
+            }
+            at_h = (int)span;
+            at_y = 0;
         }
-        if (box->at.w <= 0 || box->at.h <= 0) {
+        if ((long long)at_x + (long long)at_w > width) {
+            at_w = width - at_x;
+        }
+        if ((long long)at_y + (long long)at_h > height) {
+            at_h = height - at_y;
+        }
+        if (at_w <= 0 || at_h <= 0) {
             continue;
         }
+        box = &detector->collected[detector->collected_count];
+        box->class_id = class_id;
+        box->score = score;
+        box->region = (int)slot;
+        box->at.x = at_x;
+        box->at.y = at_y;
+        box->at.w = at_w;
+        box->at.h = at_h;
         detector->collected_count++;
     }
     return true;

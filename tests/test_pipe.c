@@ -343,6 +343,63 @@ static bool test_nan_rows_are_not_boxes(void)
     CHECK(kod_detect(detector, frame, 64, 64, boxes, KOD_BOX_MAX, &count));
     CHECK(count == 0u);
     kod_close(detector);
+
+    /* The class is cast to int. A NaN or an out-of-range value has to be
+     * rejected before that cast, not after it has already happened. */
+    CHECK(setenv("FAKE_CLASS", "nan", 1) == 0);
+    CHECK(kod_open(&detector, &options));
+    CHECK(unsetenv("FAKE_CLASS") == 0);
+    CHECK(kod_detect(detector, frame, 64, 64, boxes, KOD_BOX_MAX, &count));
+    CHECK(count == 0u);
+    kod_close(detector);
+
+    CHECK(setenv("FAKE_CLASS", "1e20", 1) == 0);
+    options.any_class = true;
+    CHECK(kod_open(&detector, &options));
+    CHECK(unsetenv("FAKE_CLASS") == 0);
+    CHECK(kod_detect(detector, frame, 64, 64, boxes, KOD_BOX_MAX, &count));
+    CHECK(count == 0u);
+    kod_close(detector);
+    options.any_class = false;
+
+    CHECK(setenv("FAKE_BOX", "0.25,1e20,0.75,1e20", 1) == 0);
+    CHECK(kod_open(&detector, &options));
+    CHECK(unsetenv("FAKE_BOX") == 0);
+    CHECK(kod_detect(detector, frame, 64, 64, boxes, KOD_BOX_MAX, &count));
+    CHECK(count == 0u);
+    kod_close(detector);
+    free(frame);
+    return true;
+}
+
+/* A crop larger than the pipe buffer must fail inside the request
+ * allowance when the child never reads, and the detector has to say so.
+ * The pipe test covers the same deadline; this is the path kilix-look
+ * and FaceNet actually call. */
+static bool test_a_stalled_detector_reports_the_deadline(void)
+{
+    static const char *const STALLS[] = {
+        "python3", "-c", "import time; time.sleep(30)", NULL};
+    kod_detector *detector = NULL;
+    kod_options options;
+    uint8_t *frame = calloc((size_t)320 * 320 * 4u, 1u);
+    kod_box boxes[1];
+    size_t count = 0u;
+    struct timespec started;
+
+    CHECK(frame != NULL);
+    kod_options_init(&options);
+    options.argv = STALLS;
+    options.size = 320;
+    options.timeout_seconds = 1;
+    options.warmup_seconds = 1;
+    CHECK(kod_open(&detector, &options));
+    (void)clock_gettime(CLOCK_MONOTONIC, &started);
+    CHECK(!kod_detect(detector, frame, 320, 320, boxes, 1u, &count));
+    CHECK(elapsed_ms_since(&started) < 2500);
+    CHECK(kod_error(detector) != NULL);
+    CHECK(strstr(kod_error(detector), "deadline") != NULL);
+    kod_close(detector);
     free(frame);
     return true;
 }
@@ -391,6 +448,19 @@ static bool test_the_public_scaler(void)
     CHECK(fit.scale == 1.0f && fit.offset_x == 0 && fit.offset_y == 0);
     CHECK(square[(8 * 32) * 4] == 0u);
     free(frame);
+
+    /* An origin near the top of the int range used to overflow the fast
+     * path's unchecked index. It must come back without a fault. */
+    {
+        uint8_t tiny[4 * 4 * 4];
+        uint8_t out[8 * 8 * 4];
+        kod_rect huge = {2000000000, 2000000000, 2000000000, 2000000000};
+
+        (void)memset(tiny, 0x11, sizeof(tiny));
+        fit = kod_scale_into_square(tiny, 4, 4, &huge, out, 8);
+        CHECK(fit.scale > 0.0f);
+        CHECK(out[0] == 0u);
+    }
     return true;
 }
 
@@ -416,6 +486,8 @@ int main(void)
         {"bad arguments are refused, not faults",
          test_bad_arguments_are_refused_not_faults},
         {"nan rows are not boxes", test_nan_rows_are_not_boxes},
+        {"a stalled detector reports the deadline",
+         test_a_stalled_detector_reports_the_deadline},
         {"every dropped region is counted",
          test_every_dropped_region_is_counted},
         {"the public scaler", test_the_public_scaler},
