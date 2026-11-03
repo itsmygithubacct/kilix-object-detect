@@ -1177,6 +1177,7 @@ static bool take_reply(kod_detector *detector)
         }
         if (rows[i][0] < 0 || (double)rows[i][0] > INT_MAX ||
             truncf(rows[i][0]) != rows[i][0] ||
+            score < 0.0f || score > 1.0f ||
             x0 < 0 || x0 > 1 || x1 < 0 || x1 > 1 ||
             y0 < 0 || y0 > 1 || y1 < 0 || y1 > 1) { continue; }
         class_id = (int)rows[i][0];

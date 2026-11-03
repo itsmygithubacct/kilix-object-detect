@@ -293,6 +293,30 @@ static bool test_the_threshold_and_the_allowlist(void)
     return true;
 }
 
+static bool test_only_probability_scores_are_admitted(void)
+{
+    const char *scores[] = {"nan", "inf", "-inf", "-.125", "1.125",
+                            "0", ".25", "1"};
+    uint8_t *frame = blank();
+    CHECK(frame != NULL);
+    for (size_t i = 0; i < sizeof(scores) / sizeof(scores[0]); ++i) {
+        kod_detector *detector = NULL;
+        kod_box boxes[KOD_BOX_MAX];
+        size_t count = 99;
+        CHECK(setenv("FAKE_SCORE", scores[i], 1) == 0);
+        CHECK(start(&detector, 0.0f));
+        CHECK(kod_detect(detector, frame, W, H, boxes, KOD_BOX_MAX, &count));
+        CHECK(count == (i < 5u ? 0u : 1u));
+        if (count != 0u) {
+            CHECK(boxes[0].score == strtof(scores[i], NULL));
+        }
+        kod_close(detector);
+    }
+    CHECK(unsetenv("FAKE_SCORE") == 0);
+    free(frame);
+    return true;
+}
+
 static bool test_a_dead_detector_is_survivable(void)
 {
     static const char *const MISSING[] = {"kilix-no-such-detector", NULL};
@@ -552,6 +576,8 @@ int main(void)
         {"every region is inferred", test_every_region_is_inferred},
         {"the threshold and the allowlist",
          test_the_threshold_and_the_allowlist},
+        {"only probability scores are admitted",
+         test_only_probability_scores_are_admitted},
         {"a dead detector is survivable",
          test_a_dead_detector_is_survivable},
         {"rejections", test_rejections},

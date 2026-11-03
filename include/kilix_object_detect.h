@@ -47,8 +47,9 @@ extern "C" {
 /*
  * The contract, shared with the sound classifier on purpose so that one
  * reader handles both replies: float32[20][6], rows of
- * [class, score, y0, x0, y1, x1] with coordinates normalised 0-1.  Every
- * detector plugin the reference implementations ship produces exactly
+ * [class, score, y0, x0, y1, x1] with coordinates normalised 0-1. Class IDs
+ * must be finite integers and scores finite probabilities in [0,1].
+ * Malformed rows are ignored. Every reference detector plugin produces exactly
  * that, which is small enough to be a pipe protocol rather than an RPC.
  */
 #define KOD_REPLY_ROWS 20
