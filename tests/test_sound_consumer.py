@@ -35,7 +35,7 @@ while len(sys.stdin.buffer.read(size)) == size:
         cls.scratch.cleanup()
 
     def run_scan(self, obj='object', sound='sound', *args):
-        env = dict(os.environ, KILIX_OBJECT_HOME=str(self.root/'look'),
+        env = dict(os.environ, KILIX_LOOK_HOME=str(self.root/'look'),
                    KILIX_SOUND_HOME=str(self.root/'sound'),
                    KILIX_OBJECT_DETECTOR=f'{sys.executable} {self.provider} {obj}',
                    KILIX_SOUND_CLASSIFIER=f'{sys.executable} {self.provider} {sound}',
@@ -48,6 +48,7 @@ while len(sys.stdin.buffer.read(size)) == size:
     def test_raw_scores_obey_per_event_override_and_scalar_fallback(self):
         r = self.run_scan()
         self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue((self.root/'look/ffmpeg-audio.log').is_file())
         self.assertIn('  heard dog 0.70', r.stdout)
         self.assertNotIn('  heard speech', r.stdout)
         self.assertNotIn('  heard shout', r.stdout)
