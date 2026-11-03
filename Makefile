@@ -145,6 +145,7 @@ test: $(TESTS) $(COMMAND)
 	done; \
 	printf '\n== %s --selftest ==\n' "$(COMMAND)"; \
 	$(COMMAND) --selftest; \
+	python3 -B tests/test_sound_consumer.py; \
 	printf '\nall test suites passed\n'
 
 sanitize: CFLAGS += -fsanitize=address,undefined -fno-omit-frame-pointer

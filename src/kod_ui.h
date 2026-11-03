@@ -32,7 +32,7 @@ typedef struct kod_ui_status {
     const float *sound_scores;
     const char *const *sound_labels;
     size_t sound_count;
-    float sound_threshold;
+    const float *sound_thresholds;
 } kod_ui_status;
 
 /* Returns NULL when this terminal cannot show graphics, with the reason

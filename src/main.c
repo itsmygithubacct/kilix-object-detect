@@ -212,6 +212,8 @@ typedef struct pipeline {
      * spins faster than the camera counts one frame many times - and then
      * differences a frame against itself and reports no motion. */
     uint64_t seen;
+    bool failed;
+    char error[160];
 } pipeline;
 
 static void pipeline_stop(pipeline *run)
@@ -271,7 +273,7 @@ static bool pipeline_start(pipeline *run, const char *source,
         char log_path[KOD_PATH_MAX];
 
         ksd_options_init(&sound_options);
-        sound_options.min_score = 0.0f;   /* the caller thresholds */
+        sound_options.min_score = options->sound_threshold;
         if (kod_paths_file(log_path, sizeof(log_path), "ffmpeg-audio.log")) {
             sound_options.log_path = log_path;
         }
@@ -283,7 +285,9 @@ static bool pipeline_start(pipeline *run, const char *source,
          * only is a fraction of the video one, and sharing would mean a
          * wedged audio model stopping the picture. */
         if (!ksd_open(&run->sound, source, &sound_options)) {
-            (void)fprintf(stderr, "kilix-look: not listening; sight only\n");
+            (void)fprintf(stderr, "kilix-look: cannot start requested sound provider\n");
+            pipeline_stop(run);
+            return false;
         }
     }
     return true;
@@ -326,8 +330,11 @@ static bool pipeline_step(
         run->motion_frames++;
     }
     if (options->whole_frame) {
-        (void)kod_detect(run->detector, pixels, run->width, run->height,
-                         boxes, KOD_BOX_MAX, box_count);
+        if (!kod_detect(run->detector, pixels, run->width, run->height,
+                         boxes, KOD_BOX_MAX, box_count)) {
+            run->failed = true;
+            (void)snprintf(run->error, sizeof(run->error), "%s", kod_error(run->detector));
+        }
         krtsp_source_release(run->source);
         return true;
     }
@@ -340,9 +347,12 @@ static bool pipeline_step(
     *region_count = kod_regions(moved, moved_count, run->width, run->height,
                                 options->size, regions, KOD_REGION_MAX, NULL);
     if (*region_count > 0u) {
-        (void)kod_detect_regions(run->detector, pixels, run->width,
+        if (!kod_detect_regions(run->detector, pixels, run->width,
                                  run->height, regions, *region_count, boxes,
-                                 KOD_BOX_MAX, box_count);
+                                 KOD_BOX_MAX, box_count)) {
+            run->failed = true;
+            (void)snprintf(run->error, sizeof(run->error), "%s", kod_error(run->detector));
+        }
     }
     krtsp_source_release(run->source);
     return true;
@@ -362,11 +372,16 @@ static size_t sound_step(pipeline *run, float *scores)
         if (latest != NULL) {
             (void)memcpy(scores, latest, sizeof(float) * KSD_CLASS_COUNT);
         }
+        return KSD_CLASS_COUNT;
     } else if (ksd_error(run->sound) != NULL) {
+        if (strcmp(ksd_error(run->sound), "the audio ended") != 0) {
+            run->failed = true;
+            (void)snprintf(run->error, sizeof(run->error), "%s", ksd_error(run->sound));
+        }
         ksd_close(run->sound);
         run->sound = NULL;
     }
-    return KSD_CLASS_COUNT;
+    return 0u;
 }
 
 static int command_scan(const char *source, const settings *options)
@@ -407,6 +422,7 @@ static int command_scan(const char *source, const settings *options)
             }
             continue;
         }
+        if (run.failed) break;
         if (kod_error(run.detector) != NULL && !complained) {
             /* Said once.  A detector that has broken stays broken, and a
              * line per frame would bury the run it broke during. */
@@ -423,12 +439,13 @@ static int command_scan(const char *source, const settings *options)
             (void)fflush(stdout);
         }
         if (run.sound != NULL) {
-            (void)sound_step(&run, sound);
-            for (size_t i = 0u; i < KSD_CLASS_COUNT; i++) {
+            const size_t heard = sound_step(&run, sound);
+            if (run.failed) break;
+            for (size_t i = 0u; i < heard; i++) {
                 if (sound[i] > sound_peak[i]) {
                     sound_peak[i] = sound[i];
                 }
-                if (sound[i] >= options->sound_threshold) {
+                if (sound[i] >= ksd_threshold(run.sound, (int)i)) {
                     (void)printf("  heard %s %.2f\n", ksd_label((int)i),
                                  (double)sound[i]);
                     sound[i] = 0.0f;
@@ -456,8 +473,12 @@ static int command_scan(const char *source, const settings *options)
         }
         (void)printf("%s\n", any ? "" : " nothing at all");
     }
-    pipeline_stop(&run);
-    return 0;
+    {
+        const int result = run.failed ? 1 : 0;
+        if (run.failed) (void)fprintf(stderr, "kilix-look: %s\n", run.error);
+        pipeline_stop(&run);
+        return result;
+    }
 }
 
 static int command_watch(const char *source, const settings *options)
@@ -474,6 +495,7 @@ static int command_watch(const char *source, const settings *options)
         options->seconds > 0 ? time(NULL) + options->seconds : 0;
     bool rendered = false;
     bool headless = options->render != NULL;
+    float sound_thresholds[KSD_CLASS_COUNT];
 
     (void)memset(sound, 0, sizeof(sound));
     for (size_t i = 0u; i < KSD_CLASS_COUNT; i++) {
@@ -520,6 +542,7 @@ static int command_watch(const char *source, const settings *options)
         if (run.sound != NULL) {
             (void)sound_step(&run, sound);
         }
+        if (run.failed) break;
         (void)memcpy(copy, frame,
                      (size_t)run.width * (size_t)run.height * 4u);
         if (options->regions) {
@@ -554,7 +577,9 @@ static int command_watch(const char *source, const settings *options)
             status.sound_scores = sound;
             status.sound_labels = labels;
             status.sound_count = KSD_CLASS_COUNT;
-            status.sound_threshold = options->sound_threshold;
+            for (size_t i = 0; i < KSD_CLASS_COUNT; ++i)
+                sound_thresholds[i] = ksd_threshold(run.sound, (int)i);
+            status.sound_thresholds = sound_thresholds;
         }
         (void)kod_ui_present(ui, copy, run.width, run.height, &status);
     }
@@ -568,8 +593,12 @@ static int command_watch(const char *source, const settings *options)
                   (unsigned long long)run.frames,
                   (unsigned long long)run.motion_frames,
                   (unsigned long long)kod_crops(run.detector));
-    pipeline_stop(&run);
-    return headless && !rendered ? 1 : 0;
+    {
+        const int result = run.failed || (headless && !rendered) ? 1 : 0;
+        if (run.failed) (void)fprintf(stderr, "kilix-look: %s\n", run.error);
+        pipeline_stop(&run);
+        return result;
+    }
 }
 
 /* -------------------------------- the rest ------------------------------- */

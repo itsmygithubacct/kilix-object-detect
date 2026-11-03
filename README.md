@@ -165,3 +165,5 @@ command.
 ## License
 
 MIT. See `LICENSE`. The weights it runs are not part of this repository.
+
+Sound consumers use `KILIX_SOUND_THRESHOLDS` class=score overrides with `--hear` as the fallback (default 0.5). Raw meters keep all scores; text events and meter threshold marks use the same per-class policy. Requested provider startup and inference failures fail the scan instead of reporting successful silence or an empty detection.

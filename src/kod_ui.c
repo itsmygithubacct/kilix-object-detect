@@ -94,7 +94,8 @@ static void draw_sound(sr_canvas *canvas, const kod_ui_status *status, int y)
     for (size_t i = 0u; i < status->sound_count; i++) {
         const int row = y + (int)i * BAR_HEIGHT;
         const float score = status->sound_scores[i];
-        const bool over = score >= status->sound_threshold;
+        const float threshold = status->sound_thresholds[i];
+        const bool over = score >= threshold;
         char value[16];
 
         sr_text(canvas, 8.0f, (float)row, status->sound_labels[i],
@@ -109,15 +110,9 @@ static void draw_sound(sr_canvas *canvas, const kod_ui_status *status, int y)
         (void)snprintf(value, sizeof(value), "%.2f", (double)score);
         sr_text(canvas, (float)(left + width + 8), (float)row, value,
                 over ? TEXT : DIM, 1.0f, 1);
-    }
-    {
-        /* The line, so a threshold is a thing you can see rather than a
-         * number you have to remember. */
-        const float x = (float)left + (float)width * status->sound_threshold;
-
-        sr_line(canvas, x, (float)y - 2.0f, x,
-                (float)(y + (int)status->sound_count * BAR_HEIGHT), 1.0f,
-                0x00FF6060u, 0.7f, 4, 4);
+        const float x = (float)left + (float)width * threshold;
+        sr_line(canvas, x, (float)row - 2.0f, x,
+                (float)(row + 12), 1.0f, 0x00FF6060u, 0.7f, 4, 4);
     }
 }
 
