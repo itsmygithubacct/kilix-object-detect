@@ -2,6 +2,15 @@
 
 What is in the picture — and only where something moved.
 
+**Status:** installable on demand from the Kilix content catalog as
+"Image Analyzer" (`kilix install kilix-object-detect`), and built automatically
+the first time a user runs `kilix look`. Kilix for Plebian-OS 0.2.3 pins commit
+`ee8ca067` from the `work/023-rc1-closure` branch, which has diverged from
+`main` (it carries the receipt-verified sound provider and supervised detector
+pipes); this README describes `main`. No weights are part of the repository;
+the detector model is installed separately (`kilix install yolo`, or the YOLOX
+runtime with `kilix install yolox`) and downloads on first use.
+
 A small C11 library that turns frames into labelled boxes, and
 **`kilix-look`**, the command built on it: point it at an image, a recording or
 a camera and see what a detector makes of it, with the sound classifier running
@@ -17,80 +26,15 @@ kilix-look watch rtsp://camera/stream --listen
 kilix-look scan yesterday.mkv --fast
 ```
 
-## Detection runs on motion crops
+## What it does
 
-This is the whole reason the module exists, and it is Frigate's shape:
-
-```
-motion boxes  ->  kod_regions()  ->  square crops  ->  one inference each
-                                                            |
-                                                    boxes, in frame coordinates
-```
-
-A detector run on whole frames pays full price for every frame and sees a
-person forty pixels tall as forty pixels. Run on crops around what moved, it
-pays only for the crops and sees that person filling the frame it is given.
-On a garden recording: **1071 frames, 46 with motion, 93 crops** — nine tenths
-of the inference never happened, and what did happen was looking at something.
-
-It also closes a hole whole-frame detection cannot. A region the operator
-marked as one to ignore stops costing detector time, because a crop is never
-taken from it. Ignoring what the model has already looked at saves nothing.
-
-The crops are square, padded a fifth beyond what moved, at least the model's
-input size, and shifted rather than shrunk at the frame edge. Overlapping
-motion merges — including chains, where A touches B and B touches C — and the
-same object seen by two crops is reported once, at the better score.
-
-## Seeing and hearing at once
-
-`--listen` runs [`kilix-sound-detect`](https://github.com/itsmygithubacct/kilix-sound-detect)
-on the same source and draws its classes under the picture. Its own ffmpeg and
-its own connection: audio-only is a fraction of the video pull, and sharing
-would mean a wedged audio model stopping the picture.
-
-A bark and a dog in the same second is a different fact from either alone.
-
-## Anything ffmpeg can open
-
-An image, a recording, an `rtsp://` camera. A recording is paced at its own
-frame rate, so pointing this at footage behaves like pointing it at the thing
-that recorded it; `--fast` reads it as quickly as it decodes, for getting
-through an archive.
-
-That is not a convenience. It is what makes the whole path testable without
-hardware, and it needed a fix in
-[`kilix-rtsp`](https://github.com/itsmygithubacct/kilix-rtsp), which had been
-handing RTSP options to whatever it was pointed at — and ffmpeg exits rather
-than ignore an option its demuxer does not have.
-
-## Design
-
-**The model is a subprocess.** The library links no ML runtime and knows
-nothing about accelerators; it writes a square of BGRA and reads back
-`float32[20][6]` — the same 480-byte contract the sound classifier uses, so one
-reader handles both. Where inference happens is a launch detail:
-
-```sh
-export KILIX_OBJECT_DETECTOR="ssh gpubox kilix-look-detect"
-```
-
-**Loading a model is not wedging.** The first reply gets 90 seconds and every
-later one gets five. A cold detector spends tens of seconds importing a
-framework, and a uniform timeout turns that into a permanent failure that looks
-exactly like "the detector never ran" — which it did, on a live run, before
-this was fixed.
-
-**An allowlist, not a threshold**, is the defence against nonsense: on still
-footage the models invented toilets and aeroplanes. Filtering by name is what
-makes a 0.25 confidence safe, and 0.45 demonstrably dropped real people in
-infrared.
-
-**Every coordinate transform is in one function.** A crop is scaled into the
-model's square, the model answers in normalised square space, and getting back
-to frame pixels means undoing the letterbox, the scale and the crop's origin.
-Boxes in the wrong place look like a working program; this family has shipped
-that bug once already.
+- Turns motion boxes into square crops (`kod_regions()`) and runs one
+  inference per crop, so detection costs what happens rather than what the
+  camera sends.
+- Merges overlapping motion and reports an object seen by two crops once.
+- Filters detections by an allowlist of class names, so a low threshold is safe.
+- `kilix-look` shows an image, a recording or an RTSP camera with what was
+  found, optionally with sound classes from kilix-sound-detect underneath.
 
 ## Commands
 
@@ -115,6 +59,31 @@ program that can only be judged by looking at it cannot be judged on a build
 server — and a picture of an empty driveway proves only that the program
 starts.
 
+Inside Kilix the same command is `kilix look` (also `kilix analyze`), for
+example `kilix look image photo.jpg` or `kilix look watch <source> --listen`.
+
+## How it works
+
+```
+source (image | recording | rtsp://)  --ffmpeg via kilix-rtsp-->  frames
+   |
+   v
+kilix-motion-detect  ->  kod_regions(): square crops around motion
+   |                        |
+   |                        v  BGRA square on stdin
+   |                 detector subprocess (KILIX_OBJECT_DETECTOR)
+   |                        |  480-byte float32[20][6] reply
+   v                        v
+boxes in frame coordinates, allowlisted, de-duplicated -> picture or text
+          (+ kilix-sound-detect classes with --listen)
+```
+
+The library links no ML runtime; the detector is a command that reads a square
+frame and writes a fixed-size reply, so where inference runs is a launch
+detail. The first reply may take 90 seconds while a framework loads; later ones
+get five. Every coordinate transform back to frame pixels is in one function.
+The full reasoning is in [docs/design.md](docs/design.md).
+
 ## Getting a model
 
 The detector is `tools/kilix-look-detect`, which wants `ultralytics` in its
@@ -134,19 +103,52 @@ export KILIX_OBJECT_DETECTOR="$HOME/.local/gpu_terminal/runtimes/yolo/venv/bin/p
                               /usr/local/bin/kilix-look-detect"
 ```
 
+[kilix-yolox](https://github.com/itsmygithubacct/kilix-yolox#readme) provides an
+Apache-2.0 detector for the same slot: `kilix install yolox` sets
+`KILIX_OBJECT_DETECTOR` to it.
+
 ## Dependencies
 
 C11 and POSIX for the library. The command adds the F120-staged public header
 and static archive from
-[`kilix-motion-detect`](https://github.com/itsmygithubacct/kilix-motion-detect)
+[`kilix-motion-detect`](https://github.com/itsmygithubacct/kilix-motion-detect#readme)
 for the motion gate. Pass `F120_PREFIX=/absolute/prefix` to use an already
 staged provider; without it, `make` stages the pinned submodule under
 `build/f120-motion` first, so a clean checkout builds on its own. The command
 also needs the vendored and pinned
-[`kilix-rtsp`](https://github.com/itsmygithubacct/kilix-rtsp) for decoding,
+[`kilix-rtsp`](https://github.com/itsmygithubacct/kilix-rtsp#readme) for decoding,
 and `kilix-sound-detect` for `--listen`. The terminal stack comes through
 kilix-rtsp's own closure. At runtime: the `ffmpeg` binary and a detector
 command.
+
+## Documentation
+
+- [docs/design.md](docs/design.md): detection on motion crops, seeing and
+  hearing at once, sources, and the detector-subprocess design.
+
+## Related repositories
+
+- [kilix-motion-detect](https://github.com/itsmygithubacct/kilix-motion-detect#readme),
+  [kilix-rtsp](https://github.com/itsmygithubacct/kilix-rtsp#readme) and
+  [kilix-sound-detect](https://github.com/itsmygithubacct/kilix-sound-detect#readme):
+  the submodules under `third_party/`.
+- [kilix-yolox](https://github.com/itsmygithubacct/kilix-yolox#readme): the
+  Apache-2.0 detector subprocess.
+- [kilix-nvr](https://github.com/itsmygithubacct/kilix-nvr#readme): the camera
+  recorder that includes this module.
+- [kilix-content](https://github.com/itsmygithubacct/kilix-content#readme): the
+  catalog entry that installs it.
+
+## Part of Plebian-OS
+
+kilix-object-detect is one of the repositories behind
+[Plebian-OS](https://github.com/itsmygithubacct/plebian-os#readme), a Debian
+install whose desktop is [Kilix](https://github.com/itsmygithubacct/kilix#readme)
+running the [Kilix 95](https://github.com/itsmygithubacct/kilix-95#readme)
+desktop through [Pleb](https://github.com/itsmygithubacct/pleb#readme).
+It is installed on demand from the Kilix content catalog as the Image Analyzer
+app. The map of every repository and how it ships is on the
+[components page](https://github.com/itsmygithubacct/plebian-os/blob/main/docs/components.md).
 
 ## License
 
