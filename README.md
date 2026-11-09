@@ -9,7 +9,9 @@ the first time a user runs `kilix look`. Kilix for Plebian-OS 0.2.3 pins commit
 `main` (it carries the receipt-verified sound provider and supervised detector
 pipes); this README describes `main`. No weights are part of the repository;
 the detector model is installed separately (`kilix install yolo`, or the YOLOX
-runtime with `kilix install yolox`) and downloads on first use.
+runtime with `kilix install yolox`) and downloads on first use, except that the
+Plebian-OS 0.2.3 ISO's offline default model bundle installs the `yolox_nano`
+and `yolox_s` models at first boot.
 
 A small C11 library that turns frames into labelled boxes, and
 **`kilix-look`**, the command built on it: point it at an image, a recording or
